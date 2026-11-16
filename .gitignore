@@ -1,0 +1,19 @@
+# runtime output
+content/fc27-broadcast/state.json
+*.log
+*.exe
+*.pdb
+
+# build / tooling scratch
+obj/
+bin/
+dist/
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# editors
+.vs/
+.idea/
+*.user
