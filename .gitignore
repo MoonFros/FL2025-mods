@@ -1,0 +1,23 @@
+# ---- runtime output (never commit generated files) ----
+mods/*/content/**/state.json
+**/state.json
+*.log
+*.exe
+*.pdb
+
+# ---- build / tooling scratch ----
+obj/
+bin/
+dist/
+__pycache__/
+.venv/
+venv/
+*.pyc
+
+# ---- editors / OS ----
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+desktop.ini
