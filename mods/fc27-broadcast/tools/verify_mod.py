@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tools/verify_mod.py -- offline validation for the EA FC 27 Broadcast mod.
+mods/fc27-broadcast/tools/verify_mod.py -- offline validation for this mod.
 
 Three layers of checks:
 
@@ -21,7 +21,7 @@ Three layers of checks:
 
 3. JSON checks: the generated state.json is parsed and its schema validated.
 
-Usage:  python3 tools/verify_mod.py [--verbose]
+Usage:  python3 mods/fc27-broadcast/tools/verify_mod.py [--verbose]
 Exit code 0 = all checks passed.
 """
 
@@ -36,7 +36,7 @@ import zlib
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LUA = os.path.join(ROOT, "modules", "FC27_Broadcast.lua")
 INI = os.path.join(ROOT, "modules", "FC27_Broadcast.ini")
-CS = os.path.join(ROOT, "overlay", "FC27_Overlay.cs")
+CS = os.path.join(ROOT, "fc27-overlay", "FC27_Overlay.cs")
 HTML = os.path.join(ROOT, "preview", "FC27_HUD_Preview.html")
 HARNESS = os.path.join(ROOT, "tools", "verify_mod.lua")
 

@@ -2234,8 +2234,8 @@ function m.launch_companion(ctx)
     local candidates = {
         sider .. "fc27-overlay\\FC27_Overlay.exe",
         sider .. "fc27-overlay/FC27_Overlay.exe",
-        sider .. "overlay\\FC27_Overlay.exe",
         sider .. "..\\fc27-overlay\\FC27_Overlay.exe",
+        sider .. "overlay\\FC27_Overlay.exe",   -- older layout
     }
     local exe = nil
     for i = 1, #candidates do

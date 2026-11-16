@@ -1,10 +1,11 @@
-# runtime output
-content/fc27-broadcast/state.json
+# ---- runtime output (never commit generated files) ----
+mods/*/content/**/state.json
+**/state.json
 *.log
 *.exe
 *.pdb
 
-# build / tooling scratch
+# ---- build / tooling scratch ----
 obj/
 bin/
 dist/
@@ -13,7 +14,10 @@ __pycache__/
 venv/
 *.pyc
 
-# editors
+# ---- editors / OS ----
 .vs/
+.vscode/
 .idea/
 *.user
+Thumbs.db
+desktop.ini
