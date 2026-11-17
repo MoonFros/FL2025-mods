@@ -582,6 +582,22 @@ namespace Ngbfc.Presentation
             return st;
         }
 
+        // the Lua side writes "home"/"away", but an older state file may carry
+        // 0/1 - both must mean the same thing
+        private static string SideName(Dictionary<string, object> d)
+        {
+            object raw;
+            if (!d.TryGetValue("side", out raw)) return "home";
+            if (raw is string)
+            {
+                string v = ((string)raw).Trim().ToLowerInvariant();
+                return (v == "1" || v == "away") ? "away" : "home";
+            }
+            if (raw is double) return ((double)raw) >= 0.5 ? "away" : "home";
+            if (raw is bool) return ((bool)raw) ? "home" : "away";
+            return "home";
+        }
+
         private static List<ScorerState> ReadScorers(object node)
         {
             var list = new List<ScorerState>();
@@ -593,7 +609,7 @@ namespace Ngbfc.Presentation
                 if (d == null) continue;
                 var sc = new ScorerState();
                 sc.Name = S(d, "name", "");
-                sc.Side = S(d, "side", "home");
+                sc.Side = SideName(d);
                 sc.Minute = I(d, "minute", 0);
                 sc.Kind = S(d, "kind", "goal");
                 list.Add(sc);
@@ -1134,6 +1150,26 @@ namespace Ngbfc.Presentation
             }
         }
 
+        // ---------------------------------------------------------------------
+        //  Target window
+        //
+        //  Two strategies, in this order:
+        //   1. a process we know by name (FL_2025 / FL2025 / PES2021 ...)
+        //   2. whatever window currently has focus, as long as it is a real
+        //      application window of another process and is at least 640x360
+        //
+        //  Strategy 2 exists because a wrong process name, or a game whose
+        //  Process.MainWindowHandle stays zero, used to mean the overlay drew
+        //  nothing at all - and silently, because every draw path hung off the
+        //  same "do we know the game window" test.
+        // ---------------------------------------------------------------------
+        private string _targetDesc = "";
+        private bool _targetIsGame;
+        private bool _screenMode;
+
+        private static readonly string[] KNOWN_GAMES =
+            { "FL_2025", "FL2025", "FL25", "PES2021", "PES2021_x64", "FootballLife2025" };
+
         private void ProbeGameWindow()
         {
             double now = _clock.Elapsed.TotalSeconds;
@@ -1143,28 +1179,71 @@ namespace Ngbfc.Presentation
             if ((now - _lastProbe) < 1.0 && _gameHwnd != IntPtr.Zero) return;
             _lastProbe = now;
 
-            _gameHwnd = IntPtr.Zero;
-            string[] wanted = { "FL_2025", "FL2025", "PES2021" };
-            Process[] procs;
-            try { procs = Process.GetProcesses(); }
-            catch { return; }
-            foreach (var w in wanted)
+            IntPtr found = IntPtr.Zero;
+            int foundPid = 0;
+            string desc = "";
+            bool isGame = false;
+
+            Process[] procs = null;
+            try { procs = Process.GetProcesses(); } catch { }
+            if (procs != null)
             {
-                foreach (var p in procs)
+                foreach (var want in KNOWN_GAMES)
                 {
-                    try
+                    foreach (var p in procs)
                     {
-                        if (string.Equals(p.ProcessName, w, StringComparison.OrdinalIgnoreCase) &&
-                            p.MainWindowHandle != IntPtr.Zero)
+                        try
                         {
-                            _gameHwnd = p.MainWindowHandle;
-                            _gamePid = p.Id;
+                            if (!string.Equals(p.ProcessName, want, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            IntPtr h = p.MainWindowHandle;
+                            if (h == IntPtr.Zero || !Native.IsWindowVisible(h)) continue;
+                            found = h;
+                            foundPid = p.Id;
+                            desc = string.Format("game process {0}.exe", p.ProcessName);
+                            isGame = true;
                             break;
                         }
+                        catch { }
                     }
-                    catch { }
+                    if (found != IntPtr.Zero) break;
                 }
-                if (_gameHwnd != IntPtr.Zero) break;
+            }
+
+            if (found == IntPtr.Zero)
+            {
+                // fallback: the focused window of another process
+                IntPtr fg = Native.GetForegroundWindow();
+                if (fg != IntPtr.Zero)
+                {
+                    int fgPid;
+                    Native.GetWindowThreadProcessId(fg, out fgPid);
+                    if (fgPid != 0 && fgPid != Process.GetCurrentProcess().Id)
+                    {
+                        Native.RECT cr;
+                        if (Native.IsWindowVisible(fg) && Native.GetClientRect(fg, out cr))
+                        {
+                            int cw = cr.Right - cr.Left, ch = cr.Bottom - cr.Top;
+                            if (cw >= 640 && ch >= 360)
+                            {
+                                found = fg;
+                                foundPid = fgPid;
+                                string pname = "pid " + fgPid;
+                                try { pname = Process.GetProcessById(fgPid).ProcessName; } catch { }
+                                desc = string.Format("focused window of {0}.exe (not a known game name)", pname);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (found != _gameHwnd || foundPid != _gamePid)
+            {
+                _gameHwnd = found;
+                _gamePid = foundPid;
+                _targetIsGame = isGame;
+                _targetDesc = found == IntPtr.Zero ? "no window found" : desc;
+                Log("target: " + _targetDesc);
             }
         }
 
@@ -1209,6 +1288,11 @@ namespace Ngbfc.Presentation
             TryReadState(false);
 
             HudState st = _state;
+            // a state file that stopped updating means the game is gone: do not
+            // leave a frozen score bug on the desktop
+            if (st != null && st.ReceivedAt > 0 &&
+                (_clock.Elapsed.TotalSeconds - st.ReceivedAt) > 10.0)
+                st = null;
             bool toastOn = _toast != null &&
                 (_clock.Elapsed.TotalSeconds - _toastStart) < Math.Max(1.0, _toast.Hold);
 
@@ -1225,7 +1309,19 @@ namespace Ngbfc.Presentation
                 }
                 startup = true;
             }
-            if (!ComputeGameRect()) { if (Visible) Hide(); return; }
+
+            // Cards need a window to sit on. Diagnostics and the startup card do
+            // not: they fall back to the whole primary screen, so the overlay can
+            // always be seen and can always say what it is waiting for.
+            _screenMode = false;
+            if (!ComputeGameRect())
+            {
+                bool mustShow = _diag || startup || _demoPhase != 0;
+                if (!mustShow) { if (Visible) Hide(); return; }
+                _screenMode = true;
+                var sb = Screen.PrimaryScreen.Bounds;
+                _winX = sb.X; _winY = sb.Y; _winW = sb.Width; _winH = sb.Height;
+            }
 
             float s = Math.Max(0.35f, Math.Min(2.6f, _winH / 1080f));
             if (_theme.Big == null || Math.Abs(_theme.Big.Size - 74f * s) > 0.5f)
@@ -1290,6 +1386,7 @@ namespace Ngbfc.Presentation
             if (toastOn && _toast != null)
                 DrawToast(g, _toast, _clock.Elapsed.TotalSeconds - _toastStart, _winW, s);
             if (startup) DrawStartupCard(g, _winW, _winH, s);
+            WriteHeartbeat();
             if (_demoPhase != 0) DrawDemoBadge(g, _winW, s);
             if (_diag) DrawDiagnostics(g, st, _winW, _winH, s);
 
@@ -2014,6 +2111,36 @@ namespace Ngbfc.Presentation
         }
 
         // ---------------------------------------------------------------------
+        //  Heartbeat: a tiny file the Lua module reads, so both sides can tell
+        //  whether the companion is actually running and what it is drawing on.
+        //  Without it, "nothing on screen" has no diagnosable cause in-game.
+        // ---------------------------------------------------------------------
+        private double _lastBeat;
+        private string _beatPath;
+
+        private void WriteHeartbeat()
+        {
+            double now = _clock.Elapsed.TotalSeconds;
+            if ((now - _lastBeat) < 2.0) return;
+            _lastBeat = now;
+            try
+            {
+                if (_beatPath == null)
+                {
+                    string dir = Path.GetDirectoryName(_statePath);
+                    if (string.IsNullOrEmpty(dir)) dir = AppDomain.CurrentDomain.BaseDirectory;
+                    _beatPath = Path.Combine(dir, "overlay_alive.txt");
+                }
+                string body = string.Format("{0} pid {1} {2:0.0} {3}\r\n{4}\r\n",
+                    Program.VERSION,
+                    System.Diagnostics.Process.GetCurrentProcess().Id,
+                    now, _targetDesc, (_screenMode ? "screen" : (_winW + "x" + _winH)));
+                File.WriteAllText(_beatPath, body);
+            }
+            catch { }
+        }
+
+        // ---------------------------------------------------------------------
         //  Startup / "no state yet" card - proof of life + where it is looking
         // ---------------------------------------------------------------------
         private bool _noStateLogged;
@@ -2024,7 +2151,7 @@ namespace Ngbfc.Presentation
             try { exists = _statePath != null && File.Exists(_statePath); } catch { }
 
             float pw = 760f * s;
-            float ph = 150f * s;
+            float ph = (_gameHwnd == IntPtr.Zero ? 176f : 150f) * s;
             var r = new RectangleF(56 * s, h - 56 * s - ph, pw, ph);
 
             Draw.GlassPanel(g, r, 10 * s, Theme.Accent);
@@ -2040,6 +2167,9 @@ namespace Ngbfc.Presentation
                     ? "state file found - waiting for the game to report"
                     : "waiting for " + ShortPath(_statePath);
                 Draw.Text(g, line, _theme.Title, muted, r.Left + 28 * s, r.Top + 86 * s);
+                if (_gameHwnd == IntPtr.Zero)
+                    Draw.Text(g, "no game window found - press F11 for diagnostics",
+                              _theme.Title, muted, r.Left + 28 * s, r.Top + 112 * s);
 
                 Draw.Spaced(g, "run FL25 in BORDERLESS / WINDOWED   ·   F11 DIAGNOSTICS   ·   F12 QUIT",
                             _theme.Micro, muted, r.Left + 28 * s, r.Bottom - 32 * s, 1.4f * s);
@@ -2080,7 +2210,7 @@ namespace Ngbfc.Presentation
 
         private void DrawDiagnostics(Graphics g, HudState st, int w, int h, float s)
         {
-            float pw = 560 * s, ph = 330 * s;
+            float pw = 640 * s, ph = 396 * s;
             var r = new RectangleF(w - pw - 40 * s, 40 * s, pw, ph);
             Draw.GlassPanel(g, r, 8 * s, Theme.Accent);
             using (var white = new SolidBrush(Theme.White))
@@ -2090,29 +2220,46 @@ namespace Ngbfc.Presentation
             {
                 Draw.Spaced(g, "NEXT-GEN BROADCAST  -  DIAGNOSTICS", _theme.Label, acc,
                             r.Left + 26 * s, r.Top + 18 * s, 1.8f * s);
+                // where the overlay thinks it is drawing, and how old the state is
+                string target = _targetDesc == "" ? "searching" : _targetDesc;
+                if (target.Length > 46) target = target.Substring(0, 46) + "...";
+                double seen = (st != null && st.ReceivedAt > 0) ? st.ReceivedAt : 0;
+                string age = seen <= 0 ? "never"
+                           : ((int)Math.Max(0, _clock.Elapsed.TotalSeconds - seen)) + "s ago";
+                var head = new List<string>
+                {
+                    "target       :  " + target,
+                    "drawn on     :  " + (_screenMode ? "primary screen (no window)" :
+                                          (_winW + "x" + _winH + (_targetIsGame ? " game" : " window"))),
+                    "state file   :  " + age + "   " + ShortPath(_statePath),
+                };
+
                 string[] rows;
                 if (st == null)
                 {
-                    rows = new[] { "state.json   :  not found", "game window  :  searching" };
+                    head.Add("state.json   :  nothing read yet");
+                    rows = head.ToArray();
                 }
                 else
                 {
                     string[] styles = { "full", "compact", "minimal" };
-                    rows = new[]
-                    {
-                        "state.json   :  OK  (seq " + st.Seq + ")",
-                        "presentation :  " + (st.Master ? "on" : "OFF"),
-                        "style        :  " + styles[Math.Max(0, Math.Min(2, st.Style))],
-                        "shot analysis:  " + (st.Analysis ? "on" : "off"),
-                        "lua ffi      :  " + (st.Ffi ? "on" : "OFF  (luajit.ext.enabled = 1)"),
-                        "stat region  :  " + (st.StatsRegion ? "found" : "not found"),
-                        "pitch region :  " + (st.PitchRegion ? "found" : "not found"),
-                        "replay cam   :  " + (st.CameraOk ? "patched" : "vanilla"),
-                        "player names :  " + (st.PlayerDb ? "Player.bin" : "fallback"),
-                        "cards seen   :  " + st.EventCount,
-                        "match clock  :  " + st.Clock,
-                        "units        :  " + st.Units,
-                    };
+                    head.Add("state.json   :  OK  (seq " + st.Seq + ")");
+                    head.Add("presentation :  " + (st.Master ? "on" : "OFF"));
+                    head.Add("style        :  " + styles[Math.Max(0, Math.Min(2, st.Style))]);
+                    head.Add("shot analysis:  " + (st.Analysis ? "on" : "off"));
+                    head.Add("lua ffi      :  " + (st.Ffi ? "on" : "OFF  (luajit.ext.enabled = 1)"));
+                    head.Add("engine data  :  scoreboard " + st.DataScore +
+                             (st.ScorerHook ? "  hook ok" : "  no hook"));
+                    head.Add("player stats :  " + (st.PlayerStats ? "validated" :
+                             "off  (calibration needed)"));
+                    head.Add("stat region  :  " + (st.StatsRegion ? "found" : "not found"));
+                    head.Add("pitch region :  " + (st.PitchRegion ? "found" : "not found"));
+                    head.Add("replay cam   :  " + (st.CameraOk ? "patched" : "vanilla"));
+                    head.Add("player names :  " + (st.PlayerDb ? "Player.bin" : "fallback"));
+                    head.Add("cards seen   :  " + st.EventCount);
+                    head.Add("match clock  :  " + st.Clock);
+                    head.Add("units        :  " + st.Units);
+                    rows = head.ToArray();
                 }
                 float yy = r.Top + 52 * s;
                 foreach (var row in rows)
@@ -2296,8 +2443,27 @@ namespace Ngbfc.Presentation
     // =========================================================================
     internal static class Program
     {
+        internal static void Log(string line)
+        {
+            try
+            {
+                string dir = AppDomain.CurrentDomain.BaseDirectory;
+                string path = Path.Combine(dir, "NGB_Overlay.log");
+                var fi = new FileInfo(path);
+                if (fi.Exists && fi.Length > 512 * 1024)
+                {
+                    string old = Path.Combine(dir, "NGB_Overlay.log.old");
+                    try { if (File.Exists(old)) File.Delete(old); File.Move(path, old); }
+                    catch { }
+                }
+                File.AppendAllText(path,
+                    DateTime.Now.ToString("HH:mm:ss") + "  " + line + "\r\n");
+            }
+            catch { }
+        }
+
         [STAThread]
-        public const string VERSION = "1.2.0";
+        public const string VERSION = "1.3.0";
 
         private static void Main(string[] args)
         {
@@ -2308,8 +2474,24 @@ namespace Ngbfc.Presentation
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            string state = LocateStateFile(args);
-            Application.Run(new OverlayForm(state));
+            // one overlay per game: running Start_NGB_Overlay.bat while the
+            // module already launched a copy would stack two sets of cards
+            bool mine;
+            using (var mutex = new System.Threading.Mutex(true, "MoonFros.NGB.Overlay",
+                                                         out mine))
+            {
+                if (!mine)
+                {
+                    Log("another NGB overlay is already running - this one exits");
+                    return;
+                }
+                string state = LocateStateFile(args);
+                Log("NGB overlay " + VERSION + " starting");
+                Log("state file: " + state +
+                    (File.Exists(state) ? "  (exists)" : "  (missing)"));
+                Application.Run(new OverlayForm(state));
+                GC.KeepAlive(mutex);
+            }
         }
 
         private static string LocateStateFile(string[] args)

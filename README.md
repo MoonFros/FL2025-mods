@@ -64,5 +64,5 @@ Rules that keep mods independent:
 
 * `mods/fc27-broadcast` — v1.0.0, 145/145 offline checks passing
   (`python3 mods/fc27-broadcast/tools/verify_mod.py`).
-* `mods/ngb-presentation` — v1.2.0, 307/307 offline checks passing
+* `mods/ngb-presentation` — v1.3.0, 324/324 offline checks passing
   (`python3 mods/ngb-presentation/tools/verify_mod.py`).

@@ -124,6 +124,10 @@ def lua_static_checks():
     check("lua: raw region dump for the decoder",
           "probe_dump" in src and "probe_region.bin" in src)
     check("lua: bucket count is configurable", "BUCKETS" in src and "stat_buckets" in src)
+    check("lua: overlay heartbeat read", "watch_overlay" in src and "overlay_alive.txt" in src)
+    check("lua: goal dedupe by count",
+          "unconfirmed" in src and "flush_fallback" in src)
+    check("lua: full time from a frozen clock", "clock_changed_at" in src)
     check("lua: creates its state folder defensively",
           "ensure_dir" in src and "make_dirs" in src and "create_directory" in src)
     check("lua: presentation styles", "cycle_style" in src and "STYLE_NAMES" in src)
@@ -271,6 +275,13 @@ def cs_checks():
     check("cs: startup / no-state card", "DrawStartupCard" in src and "waiting for" in src)
     check("cs: version const", "public const string VERSION" in src)
     check("cs: sample cards are labelled", "SAMPLE DATA" in src and "DrawDemoBadge" in src)
+    check("cs: focused-window fallback when the game name is unknown",
+          "focused window" in src and "KNOWN_GAMES" in src)
+    check("cs: diagnostics draw without a game window",
+          "_screenMode" in src and "Screen.PrimaryScreen" in src)
+    check("cs: single instance guard", "MoonFros.NGB.Overlay" in src)
+    check("cs: heartbeat for the lua side", "overlay_alive.txt" in src)
+    check("cs: stale state is dropped", "ReceivedAt > 0" in src and "10.0" in src)
     check("cs: shot card shows the shot panel when telemetry exists",
           "bool analysis = style == 0 && ev.Shot != null" in src)
     check("cs: reads the data block", "\"player_stats\"" in src and "scorer_hook" in src)

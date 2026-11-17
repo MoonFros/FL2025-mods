@@ -425,7 +425,7 @@ about 2 KB, so a reader is never more than one tick behind. Schema version **3**
 ```json
 {
   "v": 3, "seq": 842, "ts": 918273,
-  "module": "Next-Gen Broadcast", "version": "1.2.0",
+  "module": "Next-Gen Broadcast", "version": "1.3.0",
   "hud": { "enabled": true, "master": true, "style": 0, "analysis": true,
            "units": "metric", "scorebug": true,
            "credit": "MOONFROS PRESENTS", "author": "MoonFros",
@@ -437,8 +437,9 @@ about 2 KB, so a reader is never more than one tick behind. Schema version **3**
     "camera": true, "player_db": true, "names": "Player.bin",
     "events": 17, "overlay_visible": true, "style": 0, "analysis": true,
     "data": { "scoreboard": "sider", "clock": "sider", "player_stats": false,
-              "scorer_hook": true, "match_stats_ini": true,
-              "shots": 0 }
+              "scorer_hook": true, "match_stats_ini": true, "goals": 3,
+              "player_stats_ok": false, "overlay_alive": true,
+              "overlay_version": "1.3.0" }
   },
   "match": { "clock": "72:14", "period": 2, "stage": 5, "live": true,
              "score_line": "ARS 2 - 1 CHE", "pk_home": 0, "pk_away": 0,
@@ -568,6 +569,75 @@ signature to `scan_regions()`.
 Add or replace a pattern in `CAM_PATTERNS` (literal bytes plus a `check()` that
 returns the float offset and the expected default). A wrong pattern is harmless:
 it finds nothing and the camera is left untouched.
+
+---
+
+## 7b. The companion: targeting, liveness, de-duplication
+
+### Window targeting
+
+The overlay used to draw only when it could name the process (`FL_2025`,
+`FL2025`, `PES2021`) *and* that process reported a `MainWindowHandle`. Both
+conditions are outside the mod's control: a renamed exe, or a game whose main
+window is not what Win32 reports, produced a silent blank screen - including for
+F11, because every draw path hung off the same test.
+
+Now:
+
+| Order | Rule |
+|---|---|
+| 1 | a known process name with a visible main window (`KNOWN_GAMES`) |
+| 2 | the window that currently has focus, from another process, client area ≥ 640×360 |
+
+Whatever is chosen is logged as `target: ...` in `NGB_Overlay.log` and shown in
+the F11 panel. Diagnostics and the start-up card do **not** need a target at all:
+when none is found they draw on the primary screen (`_screenMode`), so the
+overlay can always be seen and can always state what it is waiting for.
+
+### Liveness
+
+The companion rewrites `content\ngb-presentation\overlay_alive.txt` every two
+seconds:
+
+```
+1.3.0 pid 4242 87.5
+game process FL_2025.exe
+1920x1080
+```
+
+`m.watch_overlay()` reads it on a 2 s cadence, keeps `m.overlay_seen` and
+`m.overlay_info`, prints `OVERLAY running <version>` or
+`OVERLAY NOT RUNNING -> run ngb-overlay\Start_NGB_Overlay.bat` in the Sider
+overlay, and publishes `status.data.overlay_alive` in `state.json`. That turns
+"nothing appeared" into an answerable question.
+
+### One goal, one card
+
+FL25 updates the scoreboard several seconds after the celebrations, while Sider's
+`goal_scored` hook fires immediately. 1.2.0 treated "score changed but not in the
+last 3 s" as an unseen goal, so a slow scoreboard produced a second, unnamed
+scorer for the same goal.
+
+The fix is counting rather than timing:
+
+* every goal the mod announces (hook **or** tier-2 detection) increments
+  `m.eng.unconfirmed[side]` (own goals credit the other side);
+* `watch_scoreboard()` consumes those counters first - a jump it can explain is
+  the board catching up, not a new goal;
+* a jump it cannot explain becomes a *pending* fallback, shown only after
+  `goal_fallback_delay_ms` (default 2500 ms) if no hook arrives, and cancelled by
+  any hook that lands in that window.
+
+Full time is likewise observed, not assumed: the match clock stopping for 8 s at
+or past 90'/120' raises the card, instead of trusting a "clock is running" byte
+that differs between builds.
+
+### Single instance
+
+`Program.Main` takes a named mutex (`MoonFros.NGB.Overlay`); a second copy logs
+and exits, so running `Start_NGB_Overlay.bat` while the module already launched
+one cannot stack two sets of cards. A state file that stops updating for 10 s is
+treated as gone, so closing the game does not leave a frozen score bug behind.
 
 ---
 

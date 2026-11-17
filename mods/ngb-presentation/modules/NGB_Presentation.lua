@@ -28,7 +28,7 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "1.2.0"
+m.VERSION = "1.3.0"
 m.STATE_VERSION = 3
 
 -- ============================================================================
@@ -607,6 +607,7 @@ m.match = {
     away = { name = "AWAY", abbr = "AWY", score = 0, color = nil, id = nil },
     clock_min = 0,
     clock_sec = 0,
+    clock_changed_at = 0,   -- last time the match clock moved
     added = 0,
     period = 0,
     paused = false,
@@ -753,8 +754,13 @@ function m.refresh_match(force)
         end
         m.eng.score.home = tonumber(st.home_score) or m.eng.score.home
         m.eng.score.away = tonumber(st.away_score) or m.eng.score.away
-        m.match.clock_min = tonumber(st.clock_minutes) or 0
-        m.match.clock_sec = tonumber(st.clock_seconds) or 0
+        local cm = tonumber(st.clock_minutes) or 0
+        local cs = tonumber(st.clock_seconds) or 0
+        if cm ~= m.match.clock_min or cs ~= m.match.clock_sec then
+            m.match.clock_changed_at = now
+        end
+        m.match.clock_min = cm
+        m.match.clock_sec = cs
         m.match.added = tonumber(st.added_minutes) or 0
         m.match.period = tonumber(st.period) or 0
         m.match.pk_home = tonumber(st.pk_home_score) or 0
@@ -792,7 +798,15 @@ function m.refresh_match(force)
         local sci2 = m.match.sci2
         if sci2 and sci2 ~= 0 then
             if m.load(sci2 + OFF.S2_MATCH_STAGE, 1) then
-                m.match.stage = m.u8(0)
+                local stage = m.u8(0)
+                -- only values the game actually documents; anything else is a
+                -- pointer that moved, and 0xFF means "unknown" rather than a
+                -- number the HUD might act on
+                if stage == STAGE_LIVE or stage == STAGE_KICKOFF or stage == STAGE_PK then
+                    m.match.stage = stage
+                else
+                    m.match.stage = 0xFF
+                end
             end
         end
     end
@@ -830,6 +844,10 @@ m.eng = {
     pending_side = nil,
     pending_until = 0,
     last_goal_name = "",
+    -- goals the hook has announced but the scoreboard has not caught up with
+    unconfirmed = { home = 0, away = 0 },
+    -- a scoreboard goal waiting for a hook that may still arrive
+    fallback = nil,
 }
 m.scorers = {}            -- every goal of the current match, in order
 m.tally_score = { home = 0, away = 0 }
@@ -1822,6 +1840,33 @@ local function hexdump(buf, len, base)
 end
 
 -- ============================================================================
+-- 14b2. Overlay heartbeat
+-- ============================================================================
+-- The companion writes <content>\ngb-presentation\overlay_alive.txt every two
+-- seconds. Reading it here is what lets the mod answer "is the overlay actually
+-- running?" instead of the player having to guess.
+function m.watch_overlay(now)
+    if not m.state.dir then return end
+    if (now - (m.overlay_checked or 0)) < 2000 then return end
+    m.overlay_checked = now
+    local f = io.open(m.state.dir .. "\\overlay_alive.txt", "r")
+    if not f then
+        m.overlay_seen = m.overlay_seen      -- keep the last timestamp
+        return
+    end
+    local text = f:read("*a") or ""
+    f:close()
+    if text == "" or text == m.overlay_text_seen then return end
+    m.overlay_text_seen = text
+    m.overlay_seen = now
+    local ver, pid, up = string.match(text, "^(%d+%.%d+%.%d+)%s+pid%s+(%d+)%s+([%d%.]+)")
+    if ver then
+        m.overlay_info = { version = ver, pid = tonumber(pid) or 0, up = tonumber(up) or 0 }
+    end
+    log_once("overlaybeat", "overlay heartbeat: " .. string.gsub(text, "[\r\n]+", " "), 30000)
+end
+
+-- ============================================================================
 -- 14c. Region dump (calibration input for tools/decode_probe.py)
 -- ============================================================================
 -- Writes <Sider>\content\ngb-presentation\probe_region.bin: the private stats
@@ -2127,6 +2172,13 @@ local function fire_shot_event(side, idx, outcome, shot_stats)
         remaining = dur,
     })
     if is_goal then
+        -- this goal has been announced, so a later scoreboard jump is the board
+        -- catching up, not a second goal
+        local credited = (outcome == "own_goal") and (1 - side) or side
+        local key = (credited == 0) and "home" or "away"
+        m.eng.unconfirmed[key] = (m.eng.unconfirmed[key] or 0) + 1
+        m.eng.fallback = nil
+
         -- let the celebration breathe for a moment, then show the card as the
         -- replay starts (0 disables the delay)
         ev.show_at = ev.started + clamp(cfg_f("goal_telemetry_delay", 1.5), 0, 8) * 1000
@@ -2192,19 +2244,27 @@ function m.goal_hook(g)
     m.tally_score.home = m.tally_score.home or 0
     m.tally_score.away = m.tally_score.away or 0
     if g.counted ~= false then
+        local credited = side
         if own then
             if side == 0 then m.tally_score.away = m.tally_score.away + 1
             else m.tally_score.home = m.tally_score.home + 1 end
+            credited = 1 - side          -- an own goal credits the other side
         else
             if side == 0 then m.tally_score.home = m.tally_score.home + 1
             else m.tally_score.away = m.tally_score.away + 1 end
         end
+        -- remember it, so the scoreboard catching up later is not treated as a
+        -- goal without a hook (that was the duplicate scorer in 1.2.0)
+        m.eng.unconfirmed[credited == 0 and "home" or "away"] =
+            (m.eng.unconfirmed[credited == 0 and "home" or "away"] or 0) + 1
+        m.eng.fallback = nil
     end
 
     local h, a = current_score()
     local total = h + a
     m.scorers[#m.scorers + 1] = {
-        name = name, side = side, minute = minute, kind = own and "own_goal" or "goal",
+        name = name, side = (side == 0) and "home" or "away",
+        minute = minute, kind = own and "own_goal" or "goal",
     }
     m.eng.goals = (m.eng.goals or 0) + 1
     m.eng.last_goal_at = now
@@ -2280,7 +2340,14 @@ function m.show_result(kind, extra)
     return ev
 end
 
--- scoreboard watcher: catches a goal whose hook did not fire, and a reset
+-- scoreboard watcher: catches a goal whose hook did not fire, and a reset.
+--
+-- Counting, not timing: the hook is the authority. Every hook goal adds one to
+-- m.eng.unconfirmed[side], and a scoreboard jump that is covered by those
+-- counters is simply the board catching up - which is exactly what happens in
+-- FL25, where the score changes several seconds after the celebration. Only a
+-- jump the hook cannot explain becomes a card, and even then it waits
+-- goal_fallback_delay_ms so a slow hook can still claim it.
 local function watch_scoreboard(now)
     if not m.eng.ok then return end
     local h, a = m.eng.score.home or 0, m.eng.score.away or 0
@@ -2288,6 +2355,8 @@ local function watch_scoreboard(now)
     if h < ph or a < pa then
         -- score went backwards: a new match (or a VAR reversal). re-baseline.
         m.eng.prev.home, m.eng.prev.away = h, a
+        m.eng.unconfirmed.home, m.eng.unconfirmed.away = 0, 0
+        m.eng.fallback = nil
         if h == 0 and a == 0 then
             m.tally_score.home, m.tally_score.away = 0, 0
             m.scorers = {}
@@ -2298,13 +2367,38 @@ local function watch_scoreboard(now)
         return
     end
     if h == ph and a == pa then return end
-    local side = (h > ph) and 0 or 1
-    local fresh = (now - (m.eng.last_goal_at or 0)) < 3000
+
+    local dh, da = h - ph, a - pa
     m.eng.prev.home, m.eng.prev.away = h, a
-    if not fresh then
-        log_msg("scoreboard goal without a hook event - showing an unnamed goal card")
-        m.goal_fallback(side)
+
+    -- goals the hook already announced are not news
+    local used_h = math.min(dh, m.eng.unconfirmed.home or 0)
+    m.eng.unconfirmed.home = (m.eng.unconfirmed.home or 0) - used_h
+    dh = dh - used_h
+    local used_a = math.min(da, m.eng.unconfirmed.away or 0)
+    m.eng.unconfirmed.away = (m.eng.unconfirmed.away or 0) - used_a
+    da = da - used_a
+    if dh <= 0 and da <= 0 then
+        m.eng.fallback = nil
+        return
     end
+
+    local side = (dh > 0) and 0 or 1
+    m.eng.fallback = { side = side, at = now }
+    log_msg(string.format("scoreboard moved to %d-%d without a hook yet - waiting %d ms",
+        h, a, cfg_i("goal_fallback_delay_ms", 2500)))
+end
+
+-- called from the tick: show the unnamed card only if the hook never arrived
+local function flush_fallback(now)
+    local f = m.eng.fallback
+    if not f then return end
+    local wait = cfg_i("goal_fallback_delay_ms", 2500)
+    if wait < 0 then wait = 0 end
+    if (now - f.at) < wait then return end
+    m.eng.fallback = nil
+    log_msg("scoreboard goal without a hook event - showing an unnamed goal card")
+    m.goal_fallback(f.side)
 end
 
 -- half time / full time watcher
@@ -2320,16 +2414,17 @@ local function watch_period(now)
     end
     if cfg_i("result_card_enabled", 1) ~= 0 and not m.ft_shown then
         local limit = (p >= 3) and 120 or 90
-        if p >= 2 and (m.match.clock_min or 0) >= limit
-           and not m.match.running and not m.match.paused then
+        -- the clock stopping is the signal, because it is observable; the
+        -- scoreboard's own "clock is running" byte differs between builds
+        local frozen = (now - (m.match.clock_changed_at or 0)) > 8000
+        if p >= 2 and (m.match.clock_min or 0) >= limit and frozen and not m.match.paused then
             if not m.ft_at then m.ft_at = now end
-            if (now - m.ft_at) > 2500 then
+            if (now - m.ft_at) > 1500 then
                 m.ft_shown = true
                 m.show_result("full_time")
             end
         end
     end
-    if not m.match.paused then m.ft_at = m.ft_at end
 end
 
 
@@ -2595,14 +2690,17 @@ local function build_state(now)
                 player_stats = m.player_stats_ok(),
                 scorer_hook = m.eng.lib,
                 match_stats_ini = m.eng.ini_ok,
-                shots = m.player_stats_ok(),
+                goals = m.eng.goals or 0,
+                player_stats_ok = m.player_stats_ok(),
+                overlay_alive = (now_ms() - (m.overlay_seen or 0)) < 6000,
+                overlay_version = (m.overlay_info and m.overlay_info.version) or "",
             },
         },
         match = {
             clock = m.clock_str(),
             period = m.match.period,
             stage = m.match.stage,
-            live = m.match.running and not m.match.paused,
+            live = (m.data_source() == "sider") and not m.match.paused,
             home = {
                 name = m.match.home.name,
                 abbr = m.match.home.abbr,
@@ -2805,6 +2903,14 @@ function m.overlay_text()
     else
         out[#out + 1] = "ENGINE   waiting for a match (scoreboard returns nothing yet)"
     end
+    local alive = (now_ms() - (m.overlay_seen or 0)) < 6000
+    if alive then
+        local inf = m.overlay_info or {}
+        out[#out + 1] = string.format("OVERLAY   running %s   (cards draw over the game)",
+            inf.version or "")
+    else
+        out[#out + 1] = "OVERLAY   NOT RUNNING  ->  run ngb-overlay\\Start_NGB_Overlay.bat"
+    end
     local regs = string.format("PLAYER DATA %s   camera %s   names %s   hud %s",
         m.player_stats_ok() and "ok" or "off",
         m.cam.ok and "ok" or "--",
@@ -2929,6 +3035,8 @@ function m.tick(now)
         read_pitch()
     end
 
+    m.watch_overlay(now)
+
     -- scoreboard watchers: no memory region involved, they run on their own
     -- clock so a goal is caught even when everything else is unavailable
     if (now - (m.poll.last_watch or 0)) >= 200 then
@@ -2936,6 +3044,7 @@ function m.tick(now)
         if not m.match.paused then
             watch_scoreboard(now)
             watch_period(now)
+            flush_fallback(now)
         end
     end
 

@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.2.0
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.3.0
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: goal cards with the real
@@ -13,8 +13,15 @@ overlay.
 Everything on screen comes from Sider's own match library and goal hook, which
 read the game directly. Nothing is guessed, and nothing is filled with zeros.
 
-1.2.0 adds the calibration toolchain (section 6) and labels the F10 demo cards
-as sample data, so you can watch every animation on your own PC without a match.
+1.3.0 fixes the two things that made the mod look broken: the overlay could not
+find the game window unless the process was called exactly FL_2025 / PES2021
+(now it falls back to the focused window, and F11 always draws), and one goal
+could produce two cards because the scoreboard updates seconds after Sider's
+hook (goals are now counted, not timed). There is also a heartbeat file, so the
+mod can tell you whether the overlay is running at all.
+
+1.2.0 added the calibration toolchain (section 6) and labelled the F10 demo
+cards as sample data, so you can watch every animation on your own PC.
 
 1.1.0 was a rewrite of the data layer: the previous version tried to find the
 per-player statistics table by scanning memory with guessed offsets, which
@@ -253,17 +260,26 @@ and nothing is filled with zeros to look complete.
  8. TROUBLESHOOTING
 --------------------------------------------------------------------------------
 
-  Nothing appears in the game
-    - Check <Sider>\ngb-overlay\overlay_log.txt first. It records when the
-      overlay started, which state.json it is watching and whether it found it.
-    - Start the overlay once by hand: ngb-overlay\Start_NGB_Overlay.bat. For the
-      first 30 seconds it draws a small card that says either "state file found"
-      or "waiting for <path>" - if you see that card, the overlay works and the
-      problem is the state file; if you see nothing, the exe is not running.
-    - The Lua module starts the overlay at game start (auto_launch_companion),
-      so after the first install you should never need the .bat again.
-    - Borderless / windowed only. In exclusive fullscreen a layered window is
-      simply not composited and nothing can appear.
+  Nothing appears in the game  (check in this order)
+    1. Is the companion running? Open the Sider overlay (its key while playing).
+       One line reads either
+           OVERLAY   running 1.3.0   (cards draw over the game)
+       or
+           OVERLAY   NOT RUNNING  ->  run ngb-overlay\Start_NGB_Overlay.bat
+       The same answer is in content\ngb-presentation\overlay_alive.txt: the
+       companion rewrites it every two seconds.
+    2. Press F11 in game. The diagnostics panel now draws even when no game
+       window is recognised, and its first two lines are
+           target       :  game process FL_2025.exe   (or "focused window of ...")
+           drawn on     :  1920x1080 game              (or "primary screen")
+       If it says "no window found", the overlay is alive but could not see the
+       game - the panel still tells you so instead of staying invisible.
+    3. Read <Sider>\ngb-overlay\NGB_Overlay.log. It logs the target window, the
+       state file it watches, and whether the file exists.
+    4. Borderless or windowed only. In exclusive fullscreen a layered window is
+       not composited and nothing can appear.
+    5. Windows 7/8 compat mode, or an antivirus blocking a new exe, also stops
+       the window from showing; the log records the start-up line either way.
 
   Cards appear but the score and clock are 0
     - match-stats.enabled = 1 is missing from sider.ini. The mod says so in the
@@ -339,6 +355,23 @@ and nothing is filled with zeros to look complete.
 --------------------------------------------------------------------------------
 11. CHANGES
 --------------------------------------------------------------------------------
+
+  1.3.0  Made visible and de-duplicated.
+         - the overlay finds the game window by name OR falls back to the
+           focused window, so a differently named exe no longer means a blank
+           screen
+         - F11 diagnostics and the start-up card draw even with no window found
+           (primary screen fallback) and show the target and the state age
+         - heartbeat file overlay_alive.txt: the mod can report whether the
+           companion is running, in the Sider overlay and in state.json
+         - one goal can no longer produce two cards: the hook is authoritative
+           and the scoreboard is matched against it by count, with a short grace
+           window (goal_fallback_delay_ms) for a slow hook
+         - full time is detected from the clock actually stopping instead of an
+           unverified "clock is running" byte
+         - single instance: a second copy exits instead of stacking cards
+         - a state file that stops updating is dropped, so no frozen score bug
+           is left behind after the game closes
 
   1.2.0  Calibration toolchain.
          - probe_dump_region writes the private stats region byte for byte
