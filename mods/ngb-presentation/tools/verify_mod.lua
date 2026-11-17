@@ -589,10 +589,36 @@ check("goal hook: per player tally", gev and gev.tally == 2, gev and gev.tally)
 
 MATCH_STATS.home_score = 3
 m.eng.last_goal_at = 0
-clock_ms = clock_ms + 6000; m.tick(clock_ms)
+clock_ms = clock_ms + 6000; m.tick(clock_ms)   -- board moved; the card waits
+clock_ms = clock_ms + 4000; m.tick(clock_ms)   -- ... and now flushes
 gev = m.ev
 check("scoreboard fallback: unnamed goal card", gev and gev.kind == "goal"
       and gev.player_known == false, gev and tostring(gev.player_known))
+
+-- the real-game ordering: the hook fires, the scoreboard catches up seconds
+-- later. That used to add a second, unnamed scorer for the same goal.
+local before = #m.scorers
+MATCH_STATS.home_score = 4
+m.on_goal_scored(CTX, { player_id = 100004, home_or_away = 0, player_name_on_shirt = "SAKA" })
+clock_ms = clock_ms + 5000; m.tick(clock_ms)
+clock_ms = clock_ms + 3000; m.tick(clock_ms)
+check("dedupe: late scoreboard goal adds no second scorer",
+      #m.scorers == before + 1, #m.scorers - before)
+check("dedupe: scorer keeps the hook's name", m.scorers[#m.scorers].name == "SAKA",
+      m.scorers[#m.scorers].name)
+check("dedupe: scorers use side names", m.scorers[#m.scorers].side == "home",
+      tostring(m.scorers[#m.scorers].side))
+
+-- an own goal credits the other side, and the board catching up is still silent
+local before_own = #m.scorers
+MATCH_STATS.away_score = 1
+m._test.goal({ side = 0, name = "OWN GUY", pid = 100009, minute = 61, kind = "own_goal" })
+clock_ms = clock_ms + 4000; m.tick(clock_ms)
+clock_ms = clock_ms + 3000; m.tick(clock_ms)
+check("dedupe: own goal + late board = one entry",
+      #m.scorers == before_own + 1, #m.scorers - before_own)
+check("own goal: entry marked as own goal", m.scorers[#m.scorers].kind == "own_goal",
+      m.scorers[#m.scorers].kind)
 
 MATCH_STATS.period = 2
 clock_ms = clock_ms + 600; m.tick(clock_ms)
@@ -738,5 +764,29 @@ end
 check("probe: LAYOUT block written", ptxt and string.find(ptxt, "LAYOUT rec_base", 1, true) ~= nil)
 check("probe: PLAYERS block written", ptxt and string.find(ptxt, "PLAYERS side idx goals", 1, true) ~= nil)
 check("probe: dump refuses without a located region", m.probe_dump(nil) == false)
+
+-- overlay heartbeat: the companion's liveness file is read and parsed
+local hb_ok = false
+if cdir then
+    local f = io.open(cdir .. "/overlay_alive.txt", "w")
+    if f then
+        f:write("1.3.0 pid 4242 12.5 game process FL_2025.exe\r\n1920x1080\r\n")
+        f:close()
+        hb_ok = true
+    end
+end
+check("heartbeat: file written for the test", hb_ok)
+m.overlay_checked = 0
+m.watch_overlay(clock_ms + 10000)
+check("heartbeat: version parsed", m.overlay_info and m.overlay_info.version == "1.3.0",
+      m.overlay_info and m.overlay_info.version)
+check("heartbeat: pid parsed", m.overlay_info and m.overlay_info.pid == 4242,
+      m.overlay_info and m.overlay_info.pid)
+clock_ms = clock_ms + 200; m.tick(clock_ms)
+local beat_state = m._test.state()
+check("heartbeat: reported in state.json",
+      beat_state.status.data.overlay_alive == true,
+      tostring(beat_state.status.data.overlay_alive))
+if cdir then os.remove(cdir .. "/overlay_alive.txt") end
 
 return RESULTS

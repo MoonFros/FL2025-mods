@@ -23,6 +23,22 @@ The overlay is click-through, never takes focus, only draws while the game
 window is in the foreground, and follows the game window when you alt-tab,
 resize it or change resolution.
 
+Liveness
+  NGB_Overlay.log           what happened: state file, target window, errors
+  ..\content\ngb-presentation\overlay_alive.txt
+                            rewritten every 2 s while the overlay runs; the Lua
+                            module reads it and reports "OVERLAY running" (or
+                            not) in the Sider overlay and in state.json
+
+Window targeting
+  First it looks for a process called FL_2025 / FL2025 / FL25 / PES2021 or
+  FootballLife2025. If none is found it falls back to the window that currently
+  has focus (any exe name), as long as it is at least 640x360. F11 diagnostics
+  and the start-up card draw on the primary screen even when no window is found,
+  so the overlay can always be seen and can always say what it is waiting for.
+
+One instance only: a second copy logs "already running" and exits.
+
 You only need Start_NGB_Overlay.bat once. The Lua module starts the overlay
 itself every time the game starts (auto_launch_companion = 1), so the .bat is a
 first-time/repair tool, not a step in your routine.
