@@ -1,7 +1,7 @@
 # Next-Gen Football Broadcast Presentation
 
 **MOONFROS PRESENTS** · created by **MoonFros** · for Football Life 2025 / PES 2021 (Sider 7)
-**v1.3.0** — engine-truth data layer, one-file calibration, and an overlay that can prove it is running.
+**v1.3.1** — engine-truth data layer, one-file calibration, and an overlay that compiles, runs and can prove both.
 
 A broadcast presentation layer for FL25: goal cards with the real scorer, minute
 and score, half-time and full-time result cards, a slim live score bug and
@@ -36,6 +36,11 @@ measured / calibrated / modelled breakdown.
 
 You never need `Start_NGB_Overlay.bat` again after the first install: the Lua
 module launches the overlay itself at game start.
+
+**Ran install.bat and saw `error CS...`?** The overlay did not compile, so no exe
+exists. 1.3.1 fixes the compiler error that stopped every build since 1.1.0
+(`[STAThread]` was attached to the version constant instead of `Main`), and
+install.bat now stops with **INSTALL INCOMPLETE** instead of claiming success.
 
 **Nothing on screen?** In order: the Sider overlay says `OVERLAY running` or
 `OVERLAY NOT RUNNING`; `content\ngb-presentation\overlay_alive.txt` is rewritten

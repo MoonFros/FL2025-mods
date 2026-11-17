@@ -425,7 +425,7 @@ about 2 KB, so a reader is never more than one tick behind. Schema version **3**
 ```json
 {
   "v": 3, "seq": 842, "ts": 918273,
-  "module": "Next-Gen Broadcast", "version": "1.3.0",
+  "module": "Next-Gen Broadcast", "version": "1.3.1",
   "hud": { "enabled": true, "master": true, "style": 0, "analysis": true,
            "units": "metric", "scorebug": true,
            "credit": "MOONFROS PRESENTS", "author": "MoonFros",
@@ -631,6 +631,23 @@ The fix is counting rather than timing:
 Full time is likewise observed, not assumed: the match clock stopping for 8 s at
 or past 90'/120' raises the card, instead of trusting a "clock is running" byte
 that differs between builds.
+
+### Build integrity
+
+The overlay is compiled on the player's machine by `Start_NGB_Overlay.bat`
+(`csc.exe` from .NET Framework 4.x), which is why a source-level mistake can
+ship invisibly: 1.1.0 - 1.3.0 had `[STAThread]` attached to the version constant
+instead of `Main`, so `csc` refused the file and no exe was produced at all. Every
+behavioural fix in those versions was therefore never executed.
+
+Guards now in place:
+
+| Guard | Where |
+|---|---|
+| `install.bat` exits with **INSTALL INCOMPLETE** and the compiler output when the build fails | `install.bat` |
+| the start script warns that it is launching an *older* exe, and prints when that exe was built | `Start_NGB_Overlay.bat` |
+| the exe writes its version into the heartbeat; the module compares it with its own and prints `OVERLAY STALE x.y.z` when they differ | `m.watch_overlay` / `overlay_text` |
+| the offline suite asserts that `[STAThread]` sits on `Main` and never on a field | `tools/verify_mod.py` |
 
 ### Single instance
 
