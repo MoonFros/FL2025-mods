@@ -19,6 +19,8 @@ set "HERE=%~dp0"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 set "LOG=%HERE%\install_log.txt"
 > "%LOG%" echo Next-Gen Broadcast install log  %DATE% %TIME%
+>> "%LOG%" echo step 0: started, looking for the Sider folder
+>> "%LOG%" echo package folder: %HERE%
 
 echo ==================================================================
 echo   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
@@ -89,6 +91,7 @@ if not exist "%SIDER%\sider.dll" (
 
 echo  Sider folder : %SIDER%
 >> "%LOG%" echo Sider folder: %SIDER%
+>> "%LOG%" echo step 1: Sider folder accepted
 echo.
 
 rem ---------------------------------------------------------------------------
@@ -110,6 +113,7 @@ if exist "%SIDER%\content\ngb-presentation" (
 )
 echo  modules\NGB_Presentation.lua + .ini      installed
 >> "%LOG%" echo copied modules
+>> "%LOG%" echo step 2: modules copied
 
 rem ---------------------------------------------------------------------------
 rem  3. the renderer (this is what actually draws the cards)
@@ -130,6 +134,7 @@ if exist "%HERE%\ngb-render\NGB_Render.dll" (
         set "DLL_OK=1"
         echo  ngb-render\NGB_Render.dll                installed
         >> "%LOG%" echo copied NGB_Render.dll
+        >> "%LOG%" echo step 3: renderer DLL installed
     )
 ) else (
     echo  [!] ngb-render\NGB_Render.dll is missing from this package.
@@ -158,17 +163,60 @@ rem  3. register the module in sider.ini
 rem ---------------------------------------------------------------------------
 echo.
 echo  sider.ini ...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%\_ngb_ini.ps1" -Ini "%SIDER%\sider.ini" -Mode add -Module "NGB_Presentation.lua"
-if errorlevel 1 goto ini_manual
+echo  calling the sider.ini editor ...
+>> "%LOG%" echo step 4: calling _ngb_ini.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%\_ngb_ini.ps1" -Ini "%SIDER%\sider.ini" -Mode add -Module "NGB_Presentation.lua" >> "%LOG%" 2>&1
+>> "%LOG%" echo step 4: powershell exit %ERRORLEVEL%
+if errorlevel 1 goto ini_batch
 
 findstr /i /c:"NGB_Presentation.lua" "%SIDER%\sider.ini" >nul 2>&1
-if errorlevel 1 goto ini_manual
+if errorlevel 1 goto ini_batch
+findstr /i /c:"match-stats.enabled" "%SIDER%\sider.ini" >nul 2>&1
+if errorlevel 1 goto ini_batch
+goto ini_ok
+
+rem ---------------------------------------------------------------------------
+rem  The PowerShell editor above is the tidy way (it inserts the lines next to
+rem  your other lua.module lines). If PowerShell is blocked or fails, this is
+rem  the plain way: add only the lines that are missing, at the end of the file.
+rem  No clipboard, no Notepad, no window to close by accident.
+rem ---------------------------------------------------------------------------
+:ini_batch
+echo.
+echo  PowerShell could not edit sider.ini. Adding the lines the simple way ...
+>> "%LOG%" echo step 4b: batch fallback
+rem  if the file does not end with a newline, an append would glue itself onto
+rem  the last line; one empty line first makes that impossible
+>> "%SIDER%\sider.ini" echo.
+findstr /i /c:"luajit.ext.enabled" "%SIDER%\sider.ini" >nul 2>&1
+if errorlevel 1 (
+    >> "%SIDER%\sider.ini" echo luajit.ext.enabled = 1
+    echo  added: luajit.ext.enabled = 1
+    >> "%LOG%" echo added luajit.ext.enabled
+)
 findstr /i /c:"match-stats.enabled" "%SIDER%\sider.ini" >nul 2>&1
 if errorlevel 1 (
-    echo  [!] sider.ini has no match-stats.enabled line - the live score and
-    echo      clock need it. Adding it with the clipboard fallback.
-    goto ini_manual
+    >> "%SIDER%\sider.ini" echo match-stats.enabled = 1
+    echo  added: match-stats.enabled = 1
+    >> "%LOG%" echo added match-stats.enabled
 )
+findstr /i /c:"NGB_Presentation.lua" "%SIDER%\sider.ini" >nul 2>&1
+if errorlevel 1 (
+    >> "%SIDER%\sider.ini" echo lua.module = "NGB_Presentation.lua"
+    echo  added: lua.module = "NGB_Presentation.lua"
+    >> "%LOG%" echo added lua.module
+)
+findstr /i /c:"NGB_Presentation.lua" "%SIDER%\sider.ini" >nul 2>&1
+if errorlevel 1 goto ini_manual
+findstr /i /c:"luajit.ext.enabled = 0" "%SIDER%\sider.ini" >nul 2>&1
+if not errorlevel 1 (
+    echo.
+    echo  [!] sider.ini still says "luajit.ext.enabled = 0" somewhere.
+    echo      Change that to 1, or the module cannot load the DLL.
+    >> "%LOG%" echo WARNING luajit.ext.enabled is 0
+)
+echo  sider.ini : lines added at the end of the file
+>> "%LOG%" echo step 4c: batch fallback succeeded
 goto ini_ok
 
 :ini_manual
@@ -246,10 +294,22 @@ echo     %SIDER%\content\ngb-presentation\heartbeat.txt  (module alive, 1/s)
 echo     %SIDER%\content\ngb-presentation\render.txt     (renderer alive, 1/s)
 echo     %SIDER%\content\ngb-presentation\state.json     (what the HUD was told)
 echo.
+echo   Doctor:    NGB_Doctor.bat (says why nothing shows, writes a report)
+echo   This log:  install_log.txt (next to install.bat)
 echo   Uninstall: run uninstall.bat from this folder.
 echo ==================================================================
 >> "%LOG%" echo INSTALL OK
+>> "%LOG%" echo step 6: finished successfully
 echo.
+echo   ----------------------------------------------------------------
+echo    Finished. This window stays open on purpose - read it, then
+echo    press any key to close it.
+echo.
+echo    If nothing shows in the game, run NGB_Doctor.bat (same folder as
+echo    install.bat). It writes ngb_doctor.txt, and that file says why.
+echo   ----------------------------------------------------------------
+echo.
+pause
 exit /b 0
 
 :build_failed
@@ -271,7 +331,8 @@ goto :eof
 :cancelled
 echo.
 echo  Cancelled - nothing was installed.
-timeout /t 3 >nul
+>> "%LOG%" echo cancelled by the user
+pause
 exit /b 1
 
 :end_fail

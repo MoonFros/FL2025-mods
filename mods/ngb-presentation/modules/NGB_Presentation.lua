@@ -3817,14 +3817,20 @@ local function declare_loader()
     local ok = true
     -- cdef returns nothing; a duplicate definition raises, so set the flag
     -- only after the call and check the flag first (idempotent across reloads).
+    -- Only what actually gets called. `ffi.cdef` is global to the LuaJIT
+    -- state, so every symbol declared here can clash with another mod that
+    -- declared it with a slightly different prototype (DWORD vs unsigned
+    -- long, FARPROC vs void*) - and a clash raises, which kills this module
+    -- at load with only one line in sider.log. Three unused declarations were
+    -- removed for exactly that reason (FreeLibrary, SetErrorMode,
+    -- GetCurrentProcess). Keep this list to what is called below.
+    log_msg("declaring Win32 loader: LoadLibraryA, GetProcAddress, " ..
+            "GetCurrentProcessId, GetModuleFileNameA")
     ffi.cdef [[
         void *LoadLibraryA(const char *name);
-        int   FreeLibrary(void *handle);
         void *GetProcAddress(void *handle, const char *name);
-        unsigned int SetErrorMode(unsigned int mode);
         unsigned int GetCurrentProcessId(void);
         unsigned int GetModuleFileNameA(void *mod, char *buf, unsigned int size);
-        void *GetCurrentProcess(void);
     ]]
     ffi.NGB_loader_cdefs = true
     return true

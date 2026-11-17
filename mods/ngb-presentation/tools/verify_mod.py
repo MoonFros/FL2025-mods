@@ -193,6 +193,25 @@ def lua_static_checks():
           "note_event" in src and "e.fired" in src and "fired for the first time" in src)
     check("lua: heartbeat file", "heartbeat.txt" in src and "write_heartbeat" in src)
     check("lua: renderer bridge", "NGB_Render.dll" in src and "NGB_Start" in src)
+
+    # A declaration that is never called is pure risk: ffi.cdef is shared with
+    # every other module in the same LuaJIT state, and a prototype that differs
+    # from theirs raises - which kills this module at load, silently, with the
+    # only evidence in sider.log. Declare what is used, and use what is declared.
+    cdef = re.search(r"ffi\.cdef \[\[(.*?)\]\]", src, re.S)
+    if not cdef:
+        check("lua: Win32 cdef present", False, "no ffi.cdef block")
+    else:
+        declared = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", cdef.group(1))
+        declared = [d for d in declared if d not in ("const",)]
+        unused = [d for d in declared if ("C." + d) not in src
+                  and ("C and C." + d) not in src]
+        check("lua: every cdef'd Win32 call is actually used", not unused,
+              ", ".join(unused) or "none")
+        check("lua: the cdef list is minimal (4 calls)", len(declared) <= 4,
+              str(len(declared)) + ": " + ", ".join(declared))
+        check("lua: the cdef says why it is minimal",
+              "a clash raises" in src or "clash with another mod" in src)
     check("lua: renderer fallback reasons are logged",
           "falling back to the C# overlay" in src)
     check("lua: stat region signature", "0x18FFE0" in src and "0xEFFE0" in src)
@@ -715,6 +734,76 @@ def packaging_checks():
     check("install: shows the branding", "moonfros presents" in low)
     check("install: manual fallback if PowerShell is blocked",
           "clip" in low and "notepad" in low)
+
+    # The window used to close the instant it finished, so a user could not
+    # tell success from a crash ("it doesn't even show if it's successful").
+    # Every exit path must pause, and every step must be in the log so a
+    # partial log pinpoints where it stopped.
+    exits_without_pause = []
+    ilines = src.replace("\r\n", "\n").split("\n")
+    for i, line in enumerate(ilines):
+        if re.match(r"\s*exit\s+/b\b", line, re.I):
+            window = "\n".join(ilines[max(0, i - 15):i]).lower()
+            if "pause" not in window:
+                exits_without_pause.append(str(i + 1))
+    check("install: every exit path waits for a key (problem 12)",
+          not exits_without_pause, "lines " + ", ".join(exits_without_pause))
+    steps = re.findall(r"step (\d+[a-z]?):", src)
+    check("install: logs each step so a short log says where it stopped",
+          len(steps) >= 6, ", ".join(steps))
+    check("install: captures the PowerShell exit code in the log",
+          "powershell exit %ERRORLEVEL%" in src)
+    # PowerShell is the tidy editor; when it is blocked there must still be a
+    # way to finish, without Notepad and the clipboard
+    check("install: has a PowerShell-free sider.ini fallback",
+          ":ini_batch" in src and "goto ini_batch" in src)
+    check("install: the fallback only adds missing lines",
+          src.count('findstr /i /c:"luajit.ext.enabled"') >= 1
+          and 'echo luajit.ext.enabled = 1' in src)
+    check("install: the fallback terminates the last line before appending",
+          '>> "%SIDER%\\sider.ini" echo.' in src)
+    check("install: warns when luajit.ext.enabled is still 0",
+          'findstr /i /c:"luajit.ext.enabled = 0"' in src)
+
+    # ---- the doctor: the one-click answer to "it does not show" -------------
+    doc_bat = os.path.join(ROOT, "NGB_Doctor.bat")
+    doc_ps1 = os.path.join(ROOT, "NGB_Doctor.ps1")
+    check("doctor: launcher present", os.path.exists(doc_bat), doc_bat)
+    check("doctor: script present", os.path.exists(doc_ps1), doc_ps1)
+    if os.path.exists(doc_bat) and os.path.exists(doc_ps1):
+        db = read(doc_bat)
+        dp = read(doc_ps1)
+        check("doctor: launcher keeps the window open",
+              "pause" in db.lower() and "-ExecutionPolicy Bypass" in db)
+        check("doctor: launcher passes a dragged Sider folder through",
+              '"%~1"' in db)
+        check("doctor: writes a report file", "ngb_doctor.txt" in dp)
+        check("doctor: changes nothing", "Set-Content" in dp
+              and ".Remove(" not in dp and "Remove-Item" not in dp)
+        check("doctor: checks the three sider.ini lines",
+              all(k in dp for k in ("luajit.ext.enabled", "match-stats.enabled",
+                                    "lua.module")))
+        check("doctor: checks the files exist",
+              all(k in dp for k in ("NGB_Presentation.lua", "NGB_Render.dll",
+                                    "NGB_Presentation.ini")))
+        check("doctor: reads the DLL's PE architecture",
+              "0x8664" in dp and "ReadUInt16" in dp)
+        check("doctor: reads sider.log for the module's lines",
+              "sider.log" in dp and "NGB" in dp)
+        check("doctor: looks for lua errors in sider.log",
+              "lua ERROR" in dp)
+        check("doctor: checks state.json / heartbeat.txt / render.txt",
+              all(k in dp for k in ("state.json", "heartbeat.txt", "render.txt")))
+        check("doctor: flags mod settings pasted into sider.ini",
+              "experimental_player_stats" in dp and "wrong file" in dp)
+        check("doctor: gives a verdict", "VERDICT" in dp)
+        # Windows PowerShell 5.1 ships on every Windows 10/11; keep to its syntax
+        modern = [t for t in ("??", "-Parallel", "ForEach-Object -Parallel",
+                              "::new(", "ConvertFrom-Json -AsHashtable")
+                  if t in dp]
+        check("doctor: PowerShell 5.1 compatible", not modern, ", ".join(modern))
+        check("doctor: ASCII only",
+              all(ord(c) < 128 for c in dp), "non-ascii character present")
 
     check("install: ini editor present", os.path.exists(ps1))
     check("ini editor: registers the module", "lua.module" in ps and "NGB_Presentation.lua" in ps)

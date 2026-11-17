@@ -80,7 +80,11 @@ Press **F8** in game.
 
 * A card stamped **DEMO – NOT REAL DATA** appears → **the renderer works**. Any
   remaining problem is data, not drawing. Go to step 3.
-* Nothing appears → the renderer is not running. Go to step 1.
+* Nothing appears → **run `NGB_Doctor.bat`**. It checks the folder, the three
+  `sider.ini` lines, the DLL (including its architecture), the logs and the
+  files the mod writes while it runs, then tells you which one is wrong. It
+  writes `ngb_doctor.txt` and changes nothing. Step 1 below is the same list
+  by hand, if you prefer to look yourself.
 * **Live player numbers say `UNAVAILABLE`** → this is by design when the DLL is
   not loaded. The DLL is also the mod's memory reader: Sider's own
   `memory.read` dereferences an address blindly, so one stale pointer would end

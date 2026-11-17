@@ -382,6 +382,69 @@ and that the remaining dereferences happen in C behind `ReadProcessMemory`.
 
 ---
 
+## 12. "The window closes and nothing shows" — an installer that said nothing
+
+**Symptom.** Reported from a real machine. `install_log.txt` stopped after
+`copied NGB_Render.dll`, the console window vanished before the user could read
+it, and the mod was not listed in Sider's overlay afterwards.
+
+**What was actually wrong.** Two separate, unrelated defects that looked like
+one:
+
+1. **The installer's success path had no `pause`.** It printed the whole
+   success screen and then hit `exit /b 0`, so the window closed the instant it
+   finished. A user cannot tell "it worked" from "it crashed" when the window
+   disappears either way. Worse, the `sider.ini` step was the one step that
+   wrote *nothing* to the log before running, so a log that ends after the DLL
+   copy could not distinguish "PowerShell failed" from "PowerShell succeeded
+   and the window closed while it was still printing".
+2. **A module that fails to load says nothing to the user.** Sider catches the
+   error with `lua_pcall`, writes one line to `sider.log` and carries on, so a
+   load-time error inside `m.init` looks exactly like "the mod was never
+   installed" — no dialog, no overlay entry, no obvious file.
+
+**Fix, part 1 — the installer.** Every step now writes `step N: ...` to
+`install_log.txt` (0, 1, 2, 3, 4, 4b, 4c, 6), PowerShell's own output and
+**exit code** are appended to the log, and *every* exit path ends with `pause`
+(the success screen says so out loud). Without PowerShell — blocked by policy,
+missing, or failing — the installer no longer falls straight to
+Notepad-and-clipboard: it appends only the lines that are missing, terminating
+the last line first so an append cannot glue itself onto it, then re-checks
+with `findstr` and warns if `luajit.ext.enabled` is still `0`.
+
+**Fix, part 2 — the doctor.** New `NGB_Doctor.bat` + `NGB_Doctor.ps1`. One
+double-click answers "why is nothing happening", using the evidence that was
+always there but buried:
+
+| check | what it proves |
+|---|---|
+| `modules\NGB_Presentation.lua` size and `function m.init` | the real file is there, not a 0-byte copy |
+| `ngb-render\NGB_Render.dll` PE `Machine == 0x8664` | the DLL is x64 and not truncated |
+| the three `sider.ini` lines, plus duplicate `lua.module` entries | the module is registered exactly once |
+| settings like `experimental_player_stats` sitting in `sider.ini` | they belong in `modules\NGB_Presentation.ini`; flagged, because that is a real mistake users make |
+| `state.json` / `heartbeat.txt` / `render.txt` timestamps | which of the three stages actually ran, and how long ago |
+| `sider.log` lines containing `NGB`, and `lua ERROR` lines | the load-time error text, if there is one |
+
+**Fix, part 3 — the load itself.** `ffi.cdef` is global to the LuaJIT state, so
+a declaration that clashes with another mod's (`DWORD` vs `unsigned long`,
+`FARPROC` vs `void *`) raises *inside* `cdef`, and that raise kills this module
+at load — silently, from the user's point of view. The module declared seven
+Win32 calls and called four; the three unused ones (`FreeLibrary`,
+`SetErrorMode`, `GetCurrentProcess`) were removed, `verify_mod.py` now fails if
+a declared symbol is never used, and the cdef is preceded by a log line naming
+exactly what is being declared, so the next `sider.log` ends with our last
+words instead of nothing.
+
+**Verified here:** `install: every exit path waits for a key`, `install: logs
+each step`, `install: captures the PowerShell exit code in the log`,
+`install: has a PowerShell-free sider.ini fallback`, `doctor: ...` (11 checks,
+including PowerShell 5.1 compatibility and ASCII-only), `lua: every cdef'd
+Win32 call is actually used`, `lua: the cdef list is minimal (4 calls)`.
+**In game: UNVERIFIED** — the doctor has not been run on a real Windows machine
+by me; it is written for PowerShell 5.1, which ships with every Windows 10/11.
+
+---
+
 ## Other changes in 2.0 (needed for the above)
 
 | change | why |
