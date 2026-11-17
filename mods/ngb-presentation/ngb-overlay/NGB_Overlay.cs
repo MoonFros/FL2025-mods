@@ -36,6 +36,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -583,11 +584,6 @@ namespace Ngbfc.Presentation
         public static readonly Color Muted = Color.FromArgb(205, 158, 168, 178);
         public static readonly Color Red = Color.FromArgb(255, 255, 90, 78);
         public static readonly Color Green = Color.FromArgb(255, 116, 214, 148);
-
-        // kept as aliases so the shared draw helpers read naturally
-        public static Color Volt { get { return Accent; } }
-        public static Color VoltDim { get { return AccentDim; } }
-        public static Color Cyan { get { return Color.FromArgb(255, 120, 196, 220); } }
 
         public string UnitSpeed = "KM/H";
         public string UnitDist = "M";
@@ -1489,7 +1485,8 @@ namespace Ngbfc.Presentation
             using (var white = new SolidBrush(Theme.White))
             using (var muted = new SolidBrush(Theme.Muted))
             {
-                Draw.Text(g, "#" + ev.Shirt, _theme.Mid, team, x, y);
+                using (var teamBrush = new SolidBrush(team))
+                    Draw.Text(g, "#" + ev.Shirt, _theme.Mid, teamBrush, x, y);
                 float numW = Draw.Width(g, "#" + ev.Shirt, _theme.Mid) + 14 * s;
                 Draw.TextClipped(g, ev.PlayerName, _theme.Name, white, x + numW, y - 16 * s,
                                  maxW - numW);

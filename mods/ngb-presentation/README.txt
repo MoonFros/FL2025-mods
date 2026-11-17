@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.0.0
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.0.1
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: live player spotlights,
@@ -234,6 +234,13 @@ statistic is random and nothing is presented as a measurement when it is not.
     - That is the game reading the same keys. Keep hotkeys_overlay_only = 1, or
       change hotkey_* in the .ini to keys you do not use.
 
+  The overlay build fails with error CS.... (compiler messages in the window)
+    - The build is plain C# for .NET Framework 4.x and compiles with no
+      downloads. If you see errors, copy the text of the window and send it on;
+      meanwhile ngb-overlay\NGB_Overlay.exe from an earlier build still starts.
+    - "csc.exe not found" means .NET Framework 4.x is missing: install
+      .NET Framework 4.8 from Windows Update and run Start_NGB_Overlay.bat.
+
 
 --------------------------------------------------------------------------------
  9. FILES INSTALLED
@@ -261,7 +268,22 @@ statistic is random and nothing is presented as a measurement when it is not.
 
 
 --------------------------------------------------------------------------------
-11. CREDITS
+11. CHANGES
+--------------------------------------------------------------------------------
+
+  1.0.1  First build compiled on Windows:
+         - fixed  NGB_Overlay.cs: TextRenderingHint needed
+                  using System.Drawing.Text
+         - fixed  NGB_Overlay.cs: the shirt number drew a Color where a
+                  Brush was expected (player spotlight card)
+         - removed two unused EA-flavoured colour aliases from the overlay
+         - corrected leftover naming in the module header and comments;
+                  the default team colour is now the MoonFros accent #D8F26B
+  1.0.0  First release.
+
+
+--------------------------------------------------------------------------------
+12. CREDITS
 --------------------------------------------------------------------------------
 
   Concept, Lua module, overlay, installer and design: MoonFros

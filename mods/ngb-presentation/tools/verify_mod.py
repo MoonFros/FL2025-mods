@@ -153,6 +153,71 @@ def ini_checks():
 # ---------------------------------------------------------------------------
 # 3. C# companion structural checks
 # ---------------------------------------------------------------------------
+
+def draw_call_audit(src):
+    """Catch the compile errors a human would only see on Windows: wrong arity
+    and Color-where-a-Brush-is-expected in Draw.* calls."""
+    import re as _re
+
+    def split_args(text):
+        out, depth, cur = [], 0, ""
+        for ch in text:
+            if ch in "([{<":
+                depth += 1
+            if ch in ")]}>":
+                depth -= 1
+            if ch == "," and depth == 0:
+                out.append(cur.strip())
+                cur = ""
+            else:
+                cur += ch
+        if cur.strip():
+            out.append(cur.strip())
+        return out
+
+    sigs = {
+        "Text": ["g", "s", "f", "brush", "f", "f"],
+        "TextRight": ["g", "s", "f", "brush", "f", "f"],
+        "TextCentre": ["g", "s", "f", "brush", "f", "f"],
+        "TextClipped": ["g", "s", "f", "brush", "f", "f", "f"],
+        "Spaced": ["g", "s", "f", "brush", "f", "f", "f"],
+        "Pill": ["g", "r", "color", "s", "f", "color", "f"],
+        "Ring": ["g", "r", "f", "color", "f", "s", "font"],
+        "GlassPanel": ["g", "r", "f", "color"],
+    }
+    color_names = set(_re.findall(r"static readonly Color (\w+)", src))
+    brush_names = set(_re.findall(r"var (\w+) = new SolidBrush", src))
+    problems = []
+    for name, params in sigs.items():
+        for m in _re.finditer(r"\bDraw\." + name + r"\s*\(", src):
+            i = m.end() - 1
+            depth, j = 0, i
+            while j < len(src):
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            args = split_args(src[i + 1:j])
+            line = src[: m.start()].count("\n") + 1
+            if len(args) != len(params):
+                problems.append("%s line %d: %d args, expected %d"
+                                % (name, line, len(args), len(params)))
+                continue
+            for k, kind in enumerate(params):
+                arg = args[k]
+                if not _re.match(r"^[A-Za-z_]\w*$", arg):
+                    continue
+                if kind == "brush" and arg in color_names:
+                    problems.append("%s line %d: Color '%s' passed for Brush"
+                                    % (name, line, arg))
+                if kind == "color" and arg in brush_names:
+                    problems.append("%s line %d: Brush '%s' passed for Color"
+                                    % (name, line, arg))
+    return problems
+
 def cs_checks():
     if not os.path.exists(CS):
         return check("cs: companion exists", False, CS)
@@ -185,6 +250,18 @@ def cs_checks():
     check("cs: minute display", "MinutesRaw" in src)
     check("cs: no external nuget deps",
           not re.search(r"using\s+Newtonsoft", src))
+
+    # compile-level traps that only Windows/csc would report
+    probs = draw_call_audit(src)
+    check("cs: Draw.* call signatures are type-correct", not probs,
+          "; ".join(probs[:3]))
+    check("cs: usings cover the types used",
+          not ("TextRenderingHint" in src and "using System.Drawing.Text;" not in src),
+          "TextRenderingHint needs System.Drawing.Text")
+    check("cs: team colour wrapped in a brush for text",
+          "new SolidBrush(team)" in src)
+    for word in ("AEFF00", "HyperMotion", "EA FC", "Volt "):
+        check("cs: no EA naming/hex (%s)" % word.strip(), word not in src)
 
 
 # ---------------------------------------------------------------------------
