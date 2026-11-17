@@ -1,7 +1,7 @@
 # Next-Gen Football Broadcast Presentation
 
 **MOONFROS PRESENTS** · created by **MoonFros** · for Football Life 2025 / PES 2021 (Sider 7)
-**v2.0.1** — the cards are drawn *inside the game's own frame* by a D3D11 renderer DLL.
+**v2.0.2** — the cards are drawn *inside the game's own frame* by a D3D11 renderer DLL.
 
 Broadcast presentation for FL25: goal cards with the real scorer, minute and
 score, half-time and full-time result cards, a slim live score bug, milestone
@@ -107,6 +107,7 @@ Press **F8** in game.
 | `MH_CreateHook(Present) failed` | MinHook could not patch Present | same as above; the C# fallback still works |
 | `MH_EnableHook failed` | same | same |
 | `hooks installed: Present=...` | the renderer is live | if F8 still shows nothing, send `ngb-dll.log` |
+| `Module (NGB_Presentation.lua) is NOT activated` in `sider.log` | start-up raised; the line above it says why | 2.0.2 fixes the `'void' is not callable` error that 2.0.0/2.0.1 always hit — reinstall and it will not appear. Otherwise send `ngb_doctor.txt` |
 | `FATAL: exception 0x... inside the Present hook` | the renderer caught its own fault and disabled itself | the game keeps running; send me that line and F7's strip |
 
 ### 2. Is the module alive?

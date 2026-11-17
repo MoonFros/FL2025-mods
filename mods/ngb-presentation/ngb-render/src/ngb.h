@@ -33,7 +33,7 @@ typedef uint64_t ULONGLONG;
 #include <windows.h>
 #endif
 
-#define NGB_VERSION   "2.0.1"
+#define NGB_VERSION   "2.0.2"
 
 /* ---------------------------------------------------------------- logging */
 void ngb_log(const char *fmt, ...);

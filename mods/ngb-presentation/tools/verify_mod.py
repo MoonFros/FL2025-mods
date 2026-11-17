@@ -194,6 +194,31 @@ def lua_static_checks():
     check("lua: heartbeat file", "heartbeat.txt" in src and "write_heartbeat" in src)
     check("lua: renderer bridge", "NGB_Render.dll" in src and "NGB_Start" in src)
 
+    # PROBLEM 13 regression gate. GetProcAddress returns `void *`; calling it
+    # without ffi.cast raises "'void' is not callable" and kills the module at
+    # load. 2.0.1 did exactly that at five call sites and nobody saw an error
+    # dialog. Every get_proc() must carry a signature, and the signature must
+    # come from one table so it cannot drift from the C header.
+    check("lua: get_proc casts through ffi.cast",
+          "return ffi.cast(ctype, fn)" in src)
+    check("lua: get_proc refuses a call site without a signature",
+          "called without a signature" in src)
+    call_sites = re.findall(r'get_proc\(\s*handle\s*,\s*"([A-Za-z_]+)"\s*(,[^)]*)?\)', src)
+    no_ctype = [n for n, extra in call_sites if not (extra or "").strip().startswith(",")]
+    check("lua: every get_proc call has a signature (problem 13)",
+          call_sites and not no_ctype,
+          "missing: " + ", ".join(no_ctype) if no_ctype else "%d call sites" % len(call_sites))
+    check("lua: every get_proc signature comes from PROTO",
+          all("PROTO." + n in src for n, _ in call_sites),
+          ", ".join(n for n, _ in call_sites))
+    proto = re.search(r"local PROTO = \{(.*?)\n\}", src, re.S)
+    check("lua: PROTO covers the five exports",
+          proto is not None and all(n in proto.group(1) for n in
+                                    ("NGB_Start", "NGB_GetState", "NGB_Read",
+                                     "NGB_Write", "NGB_Query")))
+    check("lua: NGB_GetState's const char* is converted with ffi.string",
+          "local s = ffi.string(p)" in src)
+
     # A declaration that is never called is pure risk: ffi.cdef is shared with
     # every other module in the same LuaJIT state, and a prototype that differs
     # from theirs raises - which kills this module at load, silently, with the
@@ -610,6 +635,50 @@ def lua_runtime_checks(verbose=False):
         n += 1
         results.append(("func: " + str(name), bool(ok), str(detail)))
     check("lua functional: assertions", n >= 30, "%d assertions" % n)
+
+    # ---- the renderer bridge, with an ffi that behaves like the real one ----
+    # Running the module inside lupa gives it no `ffi`, so before this test the
+    # whole DLL-loading path was dead code and a broken call could ship. The
+    # fake FFI makes a bare GetProcAddress result as uncallable as the real one.
+    ffi_test = os.path.join(ROOT, "tools", "ffi_loader_test.lua")
+    if not os.path.exists(ffi_test):
+        check("lua ffi: bridge test present", False, ffi_test)
+    else:
+        # the module builds the DLL path with a Windows separator, so on this
+        # machine the probe file has to be created with that literal name
+        try:
+            os.makedirs(os.path.join(sider, "ngb-render"), exist_ok=True)
+        except OSError:
+            pass
+        dll_tail = "ngb-render" + os.sep.replace(os.sep, "\\") + "NGB_Render.dll"
+        for name in ("NGB_Render.dll", dll_tail, os.sep.replace(os.sep, "\\") + dll_tail):
+            try:
+                with open(os.path.join(sider, name), "wb") as fh:
+                    fh.write(b"MZ\x90\x00")   # only existence is checked
+            except OSError:
+                pass
+
+        lua2 = lj.LuaRuntime(unpack_returned_tuples=True)
+        g2 = lua2.globals()
+        g2.MODSRC = read(LUA)
+        g2.SIDERDIR = sider + os.sep
+        ver = re.search(r'm\.VERSION = "([0-9.]+)"', read(LUA))
+        g2.MODVERSION = ver.group(1) if ver else "0"
+        fn2 = lua2.execute("return function(src) return assert(loadstring(src, 'ffi_test'))() end")
+        try:
+            table2 = fn2(read(ffi_test))
+        except Exception as exc:  # noqa: BLE001
+            check("lua ffi: bridge test ran", False, str(exc))
+            table2 = None
+        if table2 is not None:
+            check("lua ffi: bridge test ran", True)
+            n2 = 0
+            for i in range(1, len(table2) + 1):
+                item = table2[i]
+                n2 += 1
+                results.append(("ffi: " + str(item["name"]), bool(item["ok"]),
+                                str(item["detail"])[:80]))
+            check("lua ffi: assertions", n2 >= 20, "%d assertions" % n2)
 
     # state.json produced by the harness
     global _last_state_json

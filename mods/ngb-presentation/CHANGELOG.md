@@ -445,6 +445,76 @@ by me; it is written for PowerShell 5.1, which ships with every Windows 10/11.
 
 ---
 
+## 13. "Module is NOT activated" — the DLL was never actually called
+
+**Symptom**, from a real machine, found by `NGB_Doctor.bat`:
+
+```
+PROBLEM: Lua module (NGB_Presentation.lua) "init" function returned an error:
+  [string "NGB_Presentation.lua"]:3991: 'void' is not callable
+Module (NGB_Presentation.lua) is NOT activated
+```
+
+No cards, no `ngb-dll.log` (the DLL had never run), and no overlay entry.
+
+**Root cause.** `GetProcAddress` returns a bare address (`void *`). LuaJIT cannot
+call a bare address — it has no prototype, so it raises rather than guessing.
+Every function pointer must be cast to its real signature first:
+
+```lua
+local start = get_proc(handle, "NGB_Start")   -- void*
+local started = start(cfgtext)                -- 'void' is not callable
+```
+
+2.0.0 and 2.0.1 did that at **five** call sites (`NGB_Start`, `NGB_GetState`,
+`NGB_Read`, `NGB_Write`, `NGB_Query`), so the renderer bridge could never have
+worked — on any machine. The module died inside `m.init`, Sider logged one line
+and marked it *NOT activated*, which from the user's side is indistinguishable
+from "the mod was never installed". A second latent bug hid behind the first:
+`NGB_GetState` returns `const char *`, which LuaJIT hands back as **cdata, not a
+Lua string**, so the diagnostics panel would have shown nothing even after the
+first fix.
+
+**Why no test caught it.** `tools/verify_mod.lua` runs the module under Lua 5.5
+through lupa, which has **no `ffi`**. Every line inside `m.load_renderer` that
+touches the DLL was therefore dead code in every test run: the suite proved the
+module was correct everywhere except the one place that actually loads the
+renderer.
+
+**Fix.**
+* `get_proc(handle, name, ctype)` casts through `ffi.cast` and **refuses** to
+  run without a signature (it logs `BUG: get_proc("X") called without a
+  signature` instead of returning an uncallable pointer);
+* one `PROTO` table holds the five prototypes, copied from
+  `ngb-render/src/ngb.h`, so a signature can never drift from the C header;
+* `NGB_GetState`'s `const char *` is converted with `ffi.string` before use.
+
+**Proof.**
+* new `tools/ffi_loader_test.lua`: a **fake FFI** in which `GetProcAddress`
+  returns an object that raises `'void' is not callable` when called — the same
+  message the user's log contained — and `ffi.cast` returns a callable. It runs
+  the real `m.load_renderer` against a fake DLL and checks the config string,
+  the casts, `renderer_status()`, the memory-backend switch, and the two
+  failure paths (`NGB_Start` returning 0, missing export). **33 assertions.**
+* the test has teeth: putting the bug back (`return fn` instead of
+  `return ffi.cast(ctype, fn)`) makes it fail immediately — verified both ways.
+* static gates: every `get_proc` call site carries a signature, every signature
+  comes from `PROTO`, `PROTO` covers all five exports, and `NGB_GetState` goes
+  through `ffi.string`.
+
+**Also in 2.0.2.** The doctor now quotes the module's own environment lines
+from `sider.log` back at the user — `luajit`, `ffi`, `memory lib`, `match lib`,
+`folder layout`, `renderer wanted` — and flags a build that exposes no `match`
+library, because that is what feeds the score and the clock (the reporting
+machine's build has none, which is why its goal cards would have had no score
+even after this fix).
+
+**In game: UNVERIFIED.** The fix is proven against a fake FFI, not against
+Windows. `NGB_Doctor.bat` will show `renderer: NGB_Render.dll loaded and
+NGB_Start() called` and `ngb-dll.log` should appear the moment a match starts.
+
+---
+
 ## Other changes in 2.0 (needed for the above)
 
 | change | why |
