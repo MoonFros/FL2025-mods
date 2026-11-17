@@ -7,9 +7,10 @@ renderer hooks the game, and how to re-calibrate it for a different
 Target: **`FL_2025.exe`** (Football Life 2025) and **PES 2021 v1.7.x**,
 Sider 7.x, LuaJIT 2.1, x64, Direct3D 11.
 
-> 2.0 note: this document describes the current architecture. The 1.x version
-> claimed Sider 7.3.4 and a Win32/`ReadProcessMemory` based module; both are gone.
-> Section 1 says exactly what replaced them and why.
+> 2.0.1 note: the 1.x module used Win32 through FFI; 2.0.0 replaced that with
+> Sider's `memory` library, which turned out to be unsafe (see the `memory.read`
+> row in §1). 2.0.1 routes all memory access through the renderer DLL, which
+> uses `ReadProcessMemory`/`VirtualQuery` and therefore cannot fault.
 
 ---
 
@@ -26,9 +27,13 @@ log input memory fs audio match zlib
 (+ ffi and bit when luajit.ext.enabled = 1)
 ```
 
-Everything below was verified by reading Sider's `sider.cpp` and `soft/fs.lua`,
-and by running the module inside a sandbox with the same restrictions (see
-`tools/verify_mod.lua`).
+Everything below was verified by reading the Sider 7 sources - the environment
+is built by `push_env_table()` at `sider.cpp:6566` and applied with
+`lua_setfenv()` at `sider.cpp:6846`, the `os` table is rebuilt at
+`sider.cpp:6602` from the three names below - and by running the module inside a
+sandbox with the same restrictions (see `tools/verify_mod.lua`).
+`luaL_openlibs()` is called on the main state (`sider.cpp:6730`), so the *host*
+has everything; the module only gets the table above.
 
 | Fact | Consequence in `NGB_Presentation.lua` |
 |------|--------------------------------------|
@@ -37,9 +42,10 @@ and by running the module inside a sandbox with the same restrictions (see
 | the module must **return a table with `init`** | `local m = {} ... return m` |
 | handlers live in a *second* `lua_State` owned by Sider | handlers are fields of `m` (`m.on_display_frame`, …) and are looked up through `m.handler_for`, so the table cannot be collected and registration is table-driven |
 | Sider calls each handler through `lua_pcall` and only logs `lua ERROR from module_X:` | a bug in this module cannot crash the game; it prints one line and that handler call is skipped |
-| `memory.read(addr, n)` is an **in-process** read (`ffi.string`-like) | no `ReadProcessMemory`, no `VirtualQuery`, no `__asm__` aliases any more. An invalid address is now an access violation, so **every** read is bounds-checked against a region map first (`m.build_regions` / `m.in_region`) |
+| `memory.read(addr, n)` is `ffi.string(addr, n)` in Sider's own `memory.lua` — a **raw dereference with no page check** | this is the one call that can kill the game, and there is no `pcall` to catch it. It is therefore used only when the user sets `allow_unsafe_memory_reads = 1`. The default backend is the renderer DLL (`NGB_Read` = `ReadProcessMemory` on our own process, `NGB_Query` = `VirtualQuery`), neither of which can fault. With no DLL there is no safe reader, so reads stay off and the HUD says so. |
 | `ffi` only exists with `luajit.ext.enabled = 1` | the module degrades to "no live stats" and logs why (`memory lib = false  <-- READS DISABLED`) |
-| `ffi.cdef` is global to the LuaJIT state | the only declarations are six Win32 loader/identity calls, declared once behind `ffi.NGB_loader_cdefs` (idempotent across Sider hot-reloads) |
+| `ffi.cdef` is global to the LuaJIT state | the only declarations are the seven Win32 loader/identity calls below, declared once behind `ffi.NGB_loader_cdefs` (idempotent across Sider hot-reloads) |
+| `os` has no `remove`/`rename`/`getenv`/`exit` | nothing can delete, move or spawn anything; files are only written through `fs` (see also: a Windows `os.rename` cannot overwrite, which is the second reason the module never uses it) |
 
 The complete FFI surface, in 2.0:
 
@@ -53,9 +59,16 @@ unsigned int GetModuleFileNameA(void *mod, char *buf, unsigned int size);
 void *GetCurrentProcess(void);
 ```
 
-Nothing else. The old `NGB_ReadProcessMemory` / `NGB_VirtualQuery` /
-`NGB_VirtualProtect` / `NGB_WinExec` / `NGB_GetTickCount64` aliases are gone,
-and `verify_mod.py` fails the build if any of them comes back.
+Nothing else in the Lua module. The old `NGB_ReadProcessMemory` /
+`NGB_VirtualQuery` / `NGB_VirtualProtect` / `NGB_WinExec` / `NGB_GetTickCount64`
+aliases are gone, and `verify_mod.py` fails the build if any of them comes back.
+
+The Win32 memory calls still exist, but **inside the DLL**, where they are
+declared in C rather than through `cdef`, and where they are used exactly as
+documented: `ReadProcessMemory(GetCurrentProcess(), …)`,
+`WriteProcessMemory(GetCurrentProcess(), …)`, `VirtualQuery`, `VirtualProtect`.
+That is the whole point of §1's `memory.read` row: the safe primitives are only
+safe when they are the ones doing the reading.
 
 ### 1.1 Timing without `GetTickCount64`
 
@@ -739,6 +752,25 @@ hotkey_selftest=0x77      (F8)
 hotkey_diag=0x76          (F7)
 hotkey_kill=0x7B          (F12)
 ```
+
+### Exported API
+
+| Export | Signature | Purpose |
+|--------|-----------|---------|
+| `NGB_Start` | `int NGB_Start(const char *config)` | parse the `;`-joined config, install the hooks. Returns `1` when it hooked, `0` when it declined (already hooked, unsupported, global switch off) — the module treats `0` as "fall back". |
+| `NGB_GetState` | `const char *NGB_GetState()` | one snapshot line for the diagnostics panel: `version=…;hooked=…;frames=…;bb=WxH;state_age_ms=…;seq=…;dead=…;read=1;query=1;log=…` |
+| `NGB_Read` | `uint NGB_Read(uint64 addr, void *buf, uint len)` | **the module's safe reader.** `ReadProcessMemory(GetCurrentProcess(), …)`. Returns the bytes actually read: a bad address gives a short count, never a fault. Capped at 1 MiB per call. |
+| `NGB_Write` | `uint NGB_Write(uint64 addr, const void *buf, uint len)` | the matching writer (replay camera only), via `WriteProcessMemory` with an explicit `VirtualProtect` round-trip. |
+| `NGB_Query` | `uint NGB_Query(uint64 addr, uint64 *base, uint64 *size, uint *protect)` | `VirtualQuery`: fills the containing region so the module can build a real memory map instead of guessing bands. |
+| `NGB_Stop` | `void NGB_Stop(void)` | remove the hooks, unhook MinHook, unload-safe. Bound to F12 after confirmation. |
+| `NGB_Version` | `const char *NGB_Version(void)` | `"2.0.1"` |
+
+Why the memory calls live here and not in the Lua module: `ffi.cdef` is global to
+the LuaJIT state, so a Win32 declaration in a module leaks into every other
+module that shares the state, and the 1.x version needed `__asm__` aliases to get
+the calling convention right. In C there is no such problem, and
+`ReadProcessMemory` is the documented, non-faulting way to read another address
+in your own process — which is exactly what Sider's `memory.read` is not.
 
 ### Hooking (MinHook)
 

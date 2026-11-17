@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.0
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.1
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: goal cards with the real
@@ -197,6 +197,16 @@ C# FALLBACK WINDOW (only if renderer = overlay):
   dll_kill_hotkey          default 0x7B = F12, cards on / off
   state_write_hz           how often state.json is published (1-30, default 10)
   experimental_player_stats  0 = per-player numbers off (see section 6)
+
+  allow_unsafe_memory_reads  0 (default) = memory is read only through the
+                           renderer DLL, which cannot crash the game.
+                           1 = also allow Sider's raw memory library when the
+                           DLL is not in use. That library dereferences
+                           addresses directly, so one wrong address is a
+                           crashed game. Do not set this to 1 unless you have
+                           a reason to: without the DLL, live player numbers
+                           are simply switched off, and the score, clock and
+                           goal cards still work.
 
 
 --------------------------------------------------------------------------------
@@ -416,6 +426,10 @@ and nothing is filled with zeros to look complete.
 11. CHANGES
 --------------------------------------------------------------------------------
 
+  2.0.1  Memory reads go through the DLL. Sider's memory library reads an
+         address by dereferencing it, so a single stale pointer could end the
+         game; ReadProcessMemory cannot. Without the DLL, live player numbers
+         are switched off instead of guessed.
   2.0.0  The renderer moved inside the game.
          - New: ngb-render\NGB_Render.dll hooks IDXGISwapChain::Present and
            draws the cards on the game's own back buffer. Windowed, borderless

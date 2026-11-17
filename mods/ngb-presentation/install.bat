@@ -241,9 +241,10 @@ echo          Man of the Match.
 echo.
 echo   Logs if something is not showing:
 echo     %SIDER%\sider.log                     (module, prefixed [NGB])
-echo     %SIDER%\content\ngb-presentation\\ngb-dll.log   (renderer)
-echo     %SIDER%\content\ngb-presentation\\heartbeat.txt (module alive, 1/s)
-echo     %SIDER%\content\ngb-presentation\\render.txt    (renderer alive, 1/s)
+echo     %SIDER%\content\ngb-presentation\ngb-dll.log    (renderer)
+echo     %SIDER%\content\ngb-presentation\heartbeat.txt  (module alive, 1/s)
+echo     %SIDER%\content\ngb-presentation\render.txt     (renderer alive, 1/s)
+echo     %SIDER%\content\ngb-presentation\state.json     (what the HUD was told)
 echo.
 echo   Uninstall: run uninstall.bat from this folder.
 echo ==================================================================

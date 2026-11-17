@@ -1,7 +1,7 @@
 # Next-Gen Football Broadcast Presentation
 
 **MOONFROS PRESENTS** · created by **MoonFros** · for Football Life 2025 / PES 2021 (Sider 7)
-**v2.0.0** — the cards are drawn *inside the game's own frame* by a D3D11 renderer DLL.
+**v2.0.1** — the cards are drawn *inside the game's own frame* by a D3D11 renderer DLL.
 
 Broadcast presentation for FL25: goal cards with the real scorer, minute and
 score, half-time and full-time result cards, a slim live score bug, milestone
@@ -77,6 +77,12 @@ Press **F8** in game.
 * A card stamped **DEMO – NOT REAL DATA** appears → **the renderer works**. Any
   remaining problem is data, not drawing. Go to step 3.
 * Nothing appears → the renderer is not running. Go to step 1.
+* **Live player numbers say `UNAVAILABLE`** → this is by design when the DLL is
+  not loaded. The DLL is also the mod's memory reader: Sider's own
+  `memory.read` dereferences an address blindly, so one stale pointer would end
+  the game. There is no "just try it" fallback — see `allow_unsafe_memory_reads`
+  in the ini if you insist, but the score, clock and goal cards never needed a
+  memory read and keep working either way.
 
 ### 1. Is the DLL loaded?
 

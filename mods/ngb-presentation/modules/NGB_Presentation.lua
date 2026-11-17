@@ -13,15 +13,18 @@
 --           Sider overlay text (overlay_on)         -> last-resort fallback
 --
 --  ---------------------------------------------------------------------------
---  SANDBOX - verified against the Sider 7.4 source (sider.cpp push_env_table),
---  not assumed. Do not "correct" this list from memory.
+--  SANDBOX - verified against the Sider 7 source, not assumed:
+--    sider.cpp:6566  push_env_table()  builds the module env from a whitelist
+--    sider.cpp:6846  lua_setfenv()      applies it to the module chunk
+--  Do not "correct" this list from memory.
 --
 --    globals: assert table pairs ipairs string math tonumber tostring unpack
---             error _VERSION type io collectgarbage jit  (+ os/time,clock,date
---             only)  (+ ffi, bit when luajit.ext.enabled = 1)
+--             error _VERSION type io collectgarbage jit
+--             (+ ffi, bit only when luajit.ext.enabled = 1)
+--    os:      stripped down to time, clock, date  (no remove/rename/getenv/exit)
 --    NOT available at all: print, setmetatable, getmetatable, rawset, rawget,
 --             rawequal, coroutine, debug, package, dofile, loadfile, load,
---             loadstring, require, next, select, pcall, xpcall, _ENV
+--             loadstring, require, next, select, pcall, xpcall
 --    libraries in the env but NOT global: log, memory, fs, zlib, audio, match,
 --             input, _FILE, _G
 --
@@ -29,18 +32,24 @@
 --    * pcall/xpcall do not exist -> there is no way to catch an error. Every
 --      risky call is therefore guarded by a capability check first, and by
 --      design nothing here is allowed to raise. A Lua error inside a Sider
---      callback is caught by Sider itself (lua_pcall), so a mistake disables
---      one handler - it does not crash the game.
---    * pair() iteration is not guaranteed to hide anything, but rawset and
---      next are missing, so all tables are built with plain assignment.
+--      callback is caught by Sider itself (lua_pcall, sider.cpp:2137+), so a
+--      mistake disables one handler - it does not crash the game.
+--    * next/rawset are missing, so all tables are built with plain assignment.
+--    * os.remove/os.rename are missing too: the only way to replace a file is
+--      fs.write(tmp) then fs.write(final), which is what publish() does.
 --    * ffi must be read as a local BEFORE the module body, and the cdef must
---      be idempotent (Sider hot-reloads a module by re-running the chunk and
---      re-registering the file in the same lua_State).
+--      be idempotent (Sider hot-reloads a module by re-running the chunk in
+--      the same lua_State).
 --
---  Memory access: this module only ever uses Sider's own `memory` library
---  (memory.read / memory.unpack), never FFI Win32 calls. memory.read is a
---  plain memcpy inside the game process - no ReadProcessMemory, no
---  VirtualQuery, no VirtualProtect - so there is no page that can fault.
+--  Memory access - the honest version:
+--    memory.read is `ffi.string(addr, len)` in Sider's own memory.lua: a raw
+--    dereference with no page check. A wrong address is an access violation
+--    inside the game process, i.e. a crash, and there is no pcall to catch it.
+--    So this module NEVER calls it unless the user explicitly opts in
+--    (allow_unsafe_memory_reads = 1). The default reader is the renderer DLL:
+--    NGB_Read (ReadProcessMemory on our own process) and NGB_Query
+--    (VirtualQuery). Neither can fault; a bad address just returns 0 bytes.
+--    Without the DLL, reads stay off and the HUD says so.
 --  ============================================================================
 
 local m = {}
@@ -49,24 +58,34 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "1.3.1"
+m.VERSION = "2.0.1"
 m.STATE_VERSION = 4
 
 -- ============================================================================
--- 0. Platform: Sider's memory library (no FFI, no Win32)
+-- 0. Platform: the renderer DLL is the memory backend
 -- ============================================================================
--- History: up to 1.3.1 this section called Win32 through FFI (ReadProcessMemory,
--- VirtualQuery, WinExec, GetTickCount64) with __asm__ aliases. That is gone.
+-- History, so nobody "restores" something that was removed on purpose:
 --
---   * Sider already runs inside the game process and always exposes `memory`,
---     so ReadProcessMemory/VirtualQuery were both pointless and the riskiest
---     part of the module: a bad address faults inside the game.
---   * memory.read is documented, bounds-free (it does not check the address),
---     so every read below is wrapped by bounds()/load() which first verifies
---     the range against a region map built once from the module's own reads.
---   * Launching the companion was WinExec through FFI. The renderer is now
---     loaded by the module itself (see load_renderer), so nothing has to be
---     spawned at all - which also removes the "cmd window flash" failure mode.
+--   1.3.1  Win32 through FFI for everything (ReadProcessMemory, VirtualQuery,
+--          WinExec, GetTickCount64, __asm__ aliases).
+--   2.0.0  all of that removed; reads went through Sider's `memory` library.
+--          That was WRONG: memory.read is `ffi.string(addr, len)` (memory.lua),
+--          so one bad address is an access violation and the game dies, and
+--          the module has no pcall to catch it. The region map narrowed the
+--          window but could not close it - a region can be unmapped between
+--          the map being built and the read.
+--
+--   2.0.1  (this file) reads and writes go through the renderer DLL:
+--            NGB_Read / NGB_Write  -> ReadProcessMemory / WriteProcessMemory
+--            NGB_Query             -> VirtualQuery
+--          on our own process. ReadProcessMemory does not fault: a bad address
+--          is FALSE plus a partial byte count, which the module treats as "no
+--          data". The region map is still used, but now as an optimisation and
+--          a sanity filter rather than as the only guard.
+--
+--   Launching the companion was WinExec through FFI; the renderer is loaded by
+--   the module itself (see load_renderer), so nothing is spawned at all - which
+--   also removes the "cmd window flash" failure mode.
 --
 -- `ffi` may still exist (luajit.ext.enabled = 1) and is still used for two
 -- harmless things: converting a lightuserdata pointer to a number, and
@@ -77,8 +96,29 @@ local C = ffi_ok and ffi.C or nil
 
 -- `memory` is a Sider global (not a standard Lua one) - present in every build
 -- that ships the Lua module system. Capability-probed rather than assumed.
+-- ---------------------------------------------------------------------------
+--  Memory access.
+--
+--  Sider's own `memory.read` is `ffi.string(addr, len)`: one wrong address is
+--  an access violation and the GAME DIES. This mod used to rely on
+--  ReadProcessMemory via FFI for exactly that reason; that is gone, so the
+--  fault-free reader now comes from the renderer DLL instead:
+--
+--      NGB_Read(addr, buf, len)   -> ReadProcessMemory on our own process
+--      NGB_Query(addr, &base, &size, &protect) -> VirtualQuery
+--
+--  Neither can fault. If the DLL is not loaded there is NO safe way to read
+--  memory, so reads stay off and the module says why (score/clock still come
+--  from Sider's match library, goal cards still work).
+--
+--  allow_unsafe_memory_reads = 1 in the ini is the explicit opt-in to the raw
+--  Sider memory library for people who want memory data with renderer=overlay.
+--  It is off by default and logs a warning when used.
+-- ---------------------------------------------------------------------------
 local MEM = memory
-local mem_ok = (MEM ~= nil) and (type(MEM.read) == "function")
+local mem_ok = false            -- set once the safe backend is known
+local MEM_BACKEND = "none"      -- "dll" | "sider-unsafe" | "none"
+m.mem_backend = MEM_BACKEND
 
 local RBUF_LEN = 16384
 local rbuf = nil
@@ -376,50 +416,76 @@ end
 -- the only privileged thing this module needs.
 function m.build_regions(force)
     if not mem_ok then return false end
-    local t = os.time and os.time() or 0
-    if not force and m.regions and (t - m.regions_built) < 30 then return true end
-    if type(MEM.get_process_info) ~= "function" then
-        return false                      -- cannot verify: reads stay disabled
+    local t = (os.time and os.time()) or 0
+    if not force and m.regions and (t - (m.regions_built or 0)) < 30 then
+        return true
     end
-    local info = MEM.get_process_info()
-    if type(info) ~= "table" then return false end
+
     local rs = {}
-    local base = m.ptr_num(info.base) or m.ptr_num(info.base_address)
-    if base then
-        rs[#rs + 1] = { start = base, finish = base + 0x20000000, name = "image" }
+    if m.query_proc then
+        -- VirtualQuery through the DLL: an exact map of what is committed and
+        -- readable. Nothing here can fault, and there is no guessing.
+        local base_out = ffi.new("uint64_t[1]")
+        local size_out = ffi.new("uint64_t[1]")
+        local prot_out = ffi.new("unsigned int[1]")
+        local addr = 0x10000
+        local guard = 0
+        while addr < 0x7FFFFFFF0000 and guard < 20000 do
+            guard = guard + 1
+            local ok = m.query_proc(addr, base_out, size_out, prot_out)
+            local b = tonumber(base_out[0]) or 0
+            local sz = tonumber(size_out[0]) or 0
+            local pr = tonumber(prot_out[0]) or 0
+            if ok == 0 or sz == 0 then
+                -- unmapped: skip a whole 64 KB granule instead of stepping
+                addr = addr + 0x10000
+            else
+                -- readable, committed, not a guard page?
+                local readable = (bit and bit.band(pr, 0x100) == 0) or true
+                local committed = (pr ~= 0) and (pr ~= 0x01)
+                if readable and committed and (pr ~= 0x104) then
+                    rs[#rs + 1] = { start = b, finish = b + sz }
+                end
+                addr = b + sz
+            end
+        end
     end
-    local secs = info.sections
-    if type(secs) == "table" then
-        for i = 1, #secs do
-            local sc = secs[i]
-            if type(sc) == "table" then
-                local a = m.ptr_num(sc.start)
-                local b = m.ptr_num(sc.finish)
-                if a and b and b > a then
-                    rs[#rs + 1] = { start = a, finish = b, name = tostring(sc.name or "") }
+
+    if #rs == 0 then
+        -- fallback: the module image is always mapped, and Sider can tell us
+        -- where it is. This is a strict subset of the map above, never wider.
+        if MEM and type(MEM.get_process_info) == "function" then
+            local info = MEM.get_process_info()
+            if type(info) == "table" then
+                local base = m.ptr_num(info.base) or m.ptr_num(info.base_address)
+                if base then
+                    rs[#rs + 1] = { start = base, finish = base + 0x20000000 }
+                end
+                local secs = info.sections
+                if type(secs) == "table" then
+                    for i = 1, #secs do
+                        local sc = secs[i]
+                        if type(sc) == "table" then
+                            local a = m.ptr_num(sc.start)
+                            local b2 = m.ptr_num(sc.finish)
+                            if a and b2 and b2 > a then
+                                rs[#rs + 1] = { start = a, finish = b2 }
+                            end
+                        end
+                    end
                 end
             end
         end
     end
-    -- the game's private arenas (scoreboard, stat table, pitch block) live in
-    -- the process heap, above the image. memory.allocate_codecave gives us one
-    -- trustworthy committed arena to anchor the heap band on, and it is a
-    -- legitimate documented call (we do not execute anything in it).
-    local anchor = nil
-    if type(MEM.allocate_codecave) == "function" then
-        anchor = m.ptr_num(MEM.allocate_codecave(16))
+
+    if #rs == 0 then
+        log_once("noregions", "no readable regions could be mapped - memory reads stay off")
+        return false
     end
-    if anchor then
-        rs[#rs + 1] = { start = anchor, finish = anchor + 16, name = "anchor" }
-        -- Sider's own data lives in the same heap family as the game's; the
-        -- band is generous but still inside the 64-bit user space.
-        rs[#rs + 1] = { start = anchor - 0x40000000, finish = anchor + 0x40000000,
-                        name = "heap" }
-        m.heap_anchor = anchor
-    end
-    if #rs == 0 then return false end
     m.regions = rs
     m.regions_built = t
+    m.regions_count = #rs
+    log_msg("memory map: " .. #rs .. " readable regions")
     return true
 end
 
@@ -427,10 +493,11 @@ function m.load(addr, len)
     if type(addr) ~= "number" or addr < 0x10000 then return false end
     if len == nil or len <= 0 or len > RBUF_LEN then return false end
 
+    -- offline harness: a simulated image, no process memory involved
     if m.sim then
-        local s = m.sim(addr, len)
-        if type(s) ~= "string" or #s < len then return false end
-        rcache = s
+        local sim = m.sim(addr, len)
+        if type(sim) ~= "string" or #sim < len then return false end
+        rcache = sim
         rcache_len = len
         return true
     end
@@ -440,17 +507,32 @@ function m.load(addr, len)
         if not m.build_regions(false) then return false end
     end
     if not m.in_region(addr, len) then
-        -- the heap band can move; rebuild once, then give up for this read
+        -- the map can go stale (a region freed, the heap moved): rebuild once
         if not m.build_regions(true) then return false end
         if not m.in_region(addr, len) then return false end
     end
 
-    local s = MEM.read(addr, len)
-    if type(s) ~= "string" or #s < len then return false end
-    rcache = s
+    local got
+    if MEM_BACKEND == "dll" then
+        local buf = ffi.new("char[?]", len)
+        local n = tonumber(m.read_proc(addr, buf, len)) or 0
+        if n ~= len then return false end
+        got = ffi.string(buf, len)          -- fault-free: ReadProcessMemory
+    else
+        -- explicit opt-in only (allow_unsafe_memory_reads = 1)
+        local okcall, res = true, nil
+        if not MEM or type(MEM.read) ~= "function" then return false end
+        res = MEM.read(addr, len)           -- raw dereference: can fault
+        okcall = (type(res) == "string")
+        if not okcall or #res < len then return false end
+        got = res
+    end
+
+    rcache = got
     rcache_len = len
     return true
 end
+
 
 -- Decoders. Bounds-checked against the cached length instead of trusting the
 -- caller: a short cache can never produce a garbage number, it returns 0.
@@ -521,18 +603,28 @@ function m.read_big(addr, len)
     if type(addr) ~= "number" or addr < 0x10000 then return nil end
     if len == nil or len <= 0 or len > 64 * 1024 * 1024 then return nil end
     if m.sim then
-        local s = m.sim(addr, len)
-        if type(s) ~= "string" or #s < len then return nil end
-        return string.sub(s, 1, len)
+        local sim = m.sim(addr, len)
+        if type(sim) ~= "string" or #sim < len then return nil end
+        return string.sub(sim, 1, len)
     end
     if not mem_ok then return nil end
     if not (m.regions or m.build_regions(false)) then return nil end
-    if len > 4 * 1024 * 1024 then
-        if not m.in_region(addr, len) then return nil end
+    if not m.in_region(addr, len) then
+        if not m.build_regions(true) or not m.in_region(addr, len) then return nil end
     end
-    local s = MEM.read(addr, len)
-    if type(s) ~= "string" or #s < len then return nil end
-    return s
+    local got
+    if MEM_BACKEND == "dll" then
+        local buf = ffi.new("char[?]", len)
+        local n = tonumber(m.read_proc(addr, buf, len)) or 0
+        if n ~= len then return nil end
+        got = ffi.string(buf, len)
+    else
+        if not MEM or type(MEM.read) ~= "function" then return nil end
+        local res = MEM.read(addr, len)
+        if type(res) ~= "string" or #res < len then return nil end
+        got = res
+    end
+    return string.sub(got, 1, len)
 end
 
 -- ============================================================================
@@ -546,7 +638,7 @@ function m.ptr_num(p)
         return nil
     end
     -- lightuserdata: memory.hex() prints it as 0x....  (documented Sider call)
-    if mem_ok and type(MEM.hex) == "function" then
+    if MEM and type(MEM.hex) == "function" then
         local hx = MEM.hex(p)
         local n = hx and parse_hex(hx)
         if n and n > 0x10000 then return n end
@@ -1811,7 +1903,7 @@ local function cam_write(name, value)
 end
 
 function m.write_f32(addr, value)
-    if m.sim then if m.sim_write then m.sim_write(addr, value) end; return true end
+    if m.sim then if m.sim_write then m.sim_write(addr, str) end; return true end
     -- 4 little-endian float bytes, built without FFI so this works even when
     -- luajit.ext.enabled is not set.
     local b = f32_bytes(value)
@@ -1848,11 +1940,20 @@ function m.poke(addr, s)
     local len = #s
     if len <= 0 or len > 64 then return false end
     if m.sim then if m.sim_write then m.sim_write(addr, s) end; return true end
-    if not mem_ok or type(MEM.write) ~= "function" then return false end
+    if not mem_ok then return false end
     if not (m.regions or m.build_regions(false)) then return false end
     if not m.in_region(addr, len) then return false end
-    MEM.write(addr, s)
-    return true
+
+    if not m.write_proc then
+        -- no fault-free writer available: never fall back to a raw ffi.copy on
+        -- a page we have not changed the protection of
+        log_once("nowrite", "no safe writer available - the replay camera stays untouched")
+        return false
+    end
+    local buf = ffi.new("char[?]", len)
+    ffi.copy(buf, s, len)
+    local n = tonumber(m.write_proc(addr, buf, len)) or 0
+    return n == len
 end
 
 function m.cam_restore()
@@ -3885,6 +3986,23 @@ function m.load_renderer(ctx)
     end
 
     local state_proc = get_proc(handle, "NGB_GetState")
+
+    -- the DLL is also the module's fault-free memory backend: ReadProcessMemory
+    -- and VirtualQuery on our own process, neither of which can crash the game
+    m.read_proc = get_proc(handle, "NGB_Read")
+    m.write_proc = get_proc(handle, "NGB_Write")
+    m.query_proc = get_proc(handle, "NGB_Query")
+    if m.read_proc and m.query_proc then
+        MEM_BACKEND = "dll"
+        mem_ok = true
+        m.mem_backend = MEM_BACKEND
+        m.regions = nil                    -- force a fresh, real map
+        log_msg("memory reads: safe backend = renderer DLL " ..
+                "(ReadProcessMemory/VirtualQuery, cannot fault)")
+    else
+        log_msg("renderer DLL has no NGB_Read/NGB_Query export - memory reads stay off")
+    end
+
     m.renderer.handle = handle
     m.renderer.state = "dll"
     m.renderer.started_at = now_ms()
@@ -4124,12 +4242,31 @@ function m.init(ctx)
             "appear from the goal hook, without the score", 60000)
     end
 
-    -- first state file so the companion can start straight away
+    -- first state file so the renderer can start straight away
     m.write_state(now_ms())
 
     -- the DLL draws the cards inside the game's own frame; if it cannot load
     -- we fall back to the C# window and say exactly why (never silently)
     m.load_renderer(ctx)
+
+    -- No DLL means no safe memory backend. Sider's memory library dereferences
+    -- addresses directly, so using it can crash the game; that is opt-in only.
+    if MEM_BACKEND == "none" then
+        if cfg_i("allow_unsafe_memory_reads", 0) ~= 0 and MEM and type(MEM.read) == "function" then
+            MEM_BACKEND = "sider-unsafe"
+            mem_ok = true
+            m.mem_backend = MEM_BACKEND
+            log_msg("WARNING: allow_unsafe_memory_reads = 1 - using Sider's raw " ..
+                    "memory library. A wrong address can crash the game. " ..
+                    "Set it back to 0, or install ngb-render\\NGB_Render.dll.")
+        else
+            mem_ok = false
+            m.mem_backend = "none"
+            log_msg("memory reads: OFF (no safe backend). Score and clock come " ..
+                    "from Sider's match library; live player numbers are " ..
+                    "unavailable. Install ngb-render\\NGB_Render.dll to enable them.")
+        end
+    end
     read_identity()
     log_msg(string.format("game identity: pid %d  exe %s  (source %s)",
         m.ident.pid or 0, (m.ident.exe ~= "" and m.ident.exe or "unknown"),
@@ -4149,6 +4286,14 @@ m._test = {
     detect_events = function() return detect_events() end,
     set_cfg = function(t) for k, v in pairs(t) do cfg[k] = v end end,
     set_region = function(s, p) m.reg.stats = s or 0; m.reg.pitch = p or 0; m.reg.ok = (m.reg.stats ~= 0) end,
+    -- the offline harness supplies a simulated image; tell the module it has a
+    -- working backend, exactly as the DLL does in game
+    set_mem = function(okflag, name)
+        mem_ok = (okflag == true)
+        MEM_BACKEND = name or (mem_ok and "sim" or "none")
+        m.mem_backend = MEM_BACKEND
+    end,
+    mem_backend = function() return MEM_BACKEND end,
     reset = function() m.ev = nil; m.baselined = false; m.ps = { [0] = {}, [1] = {} }; m.fx = {} end,
     state = function() return build_state(now_ms()) end,
 }

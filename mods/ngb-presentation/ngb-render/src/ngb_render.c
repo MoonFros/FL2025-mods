@@ -669,11 +669,66 @@ __declspec(dllexport) const char *NGB_GetState(void)
     int age = ngb_state_age_ms();
     snprintf(buf, sizeof buf,
              "version=%s;hooks=%d;enabled=%d;faults=%d;frames=%d;backbuffer=%dx%d;"
-             "state_age_ms=%d;state_seq=%d;dead=%d;log=%s",
+             "state_age_ms=%d;state_seq=%d;dead=%d;read=1;query=1;log=%s",
              NGB_VERSION, (int)s_hooked, g_enabled ? 1 : 0,
              (int)s_present_faults, (int)s_frames, (int)s_bb_w, (int)s_bb_h,
              age, st.state_seq, g_dead ? 1 : 0, s_log_file);
     return buf;
+}
+
+/* ---------------------------------------------------------------------------
+ *  Safe memory access for the Lua module.
+ *
+ *  Sider's own `memory.read` is `ffi.string(addr, len)`: a straight
+ *  dereference, so one wrong address is an access violation and the game dies.
+ *  ReadProcessMemory on our own process never faults - it returns FALSE and a
+ *  partial count instead - and VirtualQuery only describes pages. Exposing both
+ *  through this DLL is what makes the module's memory reads crash-proof.
+ * ------------------------------------------------------------------------- */
+__declspec(dllexport) unsigned int NGB_Read(unsigned long long addr, void *buf,
+                                            unsigned int len)
+{
+    SIZE_T got = 0;
+    if (!buf || len == 0 || len > (1u << 20) || addr < 0x10000ULL) return 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)addr, buf,
+                           len, &got))
+        return (unsigned int)got;          /* partial read: caller checks */
+    return (unsigned int)got;
+}
+
+__declspec(dllexport) unsigned int NGB_Write(unsigned long long addr, const void *buf,
+                                             unsigned int len)
+{
+    SIZE_T wrote = 0;
+    DWORD old = 0;
+    if (!buf || len == 0 || len > (1u << 20) || addr < 0x10000ULL) return 0;
+    /* only pages the module already decided are legitimate; we still ask for
+     * write access explicitly so a read-only page is not a crash */
+    VirtualProtect((LPVOID)(uintptr_t)addr, len, PAGE_EXECUTE_READWRITE, &old);
+    BOOL ok = WriteProcessMemory(GetCurrentProcess(), (LPVOID)(uintptr_t)addr,
+                                 buf, len, &wrote);
+    VirtualProtect((LPVOID)(uintptr_t)addr, len, old, &old);
+    if (!ok) return (unsigned int)wrote;
+    return (unsigned int)wrote;
+}
+
+__declspec(dllexport) unsigned int NGB_Query(unsigned long long addr,
+                                             unsigned long long *base,
+                                             unsigned long long *size,
+                                             unsigned int *protect)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!base || !size) return 0;
+    if (VirtualQuery((LPCVOID)(uintptr_t)addr, &mbi, sizeof mbi) == 0) {
+        *base = addr;
+        *size = 0;
+        if (protect) *protect = 0;
+        return 0;
+    }
+    *base = (unsigned long long)(uintptr_t)mbi.BaseAddress;
+    *size = (unsigned long long)mbi.RegionSize;
+    if (protect) *protect = (unsigned int)mbi.Protect;
+    return 1;
 }
 
 __declspec(dllexport) void NGB_Stop(void)

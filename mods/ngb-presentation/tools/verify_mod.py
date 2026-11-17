@@ -176,7 +176,13 @@ def lua_static_checks():
     check("lua: no VirtualProtect", "NGB_VirtualProtect" not in src)
     check("lua: no WinExec", "NGB_WinExec" not in src)
     check("lua: no __asm__ aliases in code", "__asm__" not in code)
-    check("lua: uses Sider memory lib", "MEM.read" in src and "MEM.write" in src)
+    # memory access is routed through the renderer DLL's fault-free reader;
+    # Sider's raw `memory.read` is only reachable through an explicit opt-in
+    check("lua: safe memory backend from the DLL",
+          "NGB_Read" in src and "NGB_Query" in src and "read_proc" in src)
+    check("lua: unsafe reader is opt-in and warned about",
+          "allow_unsafe_memory_reads" in src
+          and "can crash the game" in src)
     check("lua: bounds map before every read", "in_region" in src and "build_regions" in src)
     check("lua: guarded ffi cdef (idempotent)",
           "if ffi.NGB_loader_cdefs then return true end" in src)
@@ -685,6 +691,19 @@ def packaging_checks():
     check("install: names every log file in the success message",
           all(k in low for k in ("sider.log", "ngb-dll.log", "heartbeat.txt",
                                  "render.txt")))
+    # The success message prints real paths. `\\` is not an escape in batch, so
+    # a doubled backslash reaches the user verbatim; catch it here.
+    doubled = [ln.strip() for ln in src.splitlines()
+               if ln.lstrip().lower().startswith("echo") and "\\\\" in ln
+               and "%sider%" in ln.lower()]
+    check("install: no doubled backslashes in printed paths", not doubled,
+          "; ".join(doubled[:2]))
+    # and the paths must be the ones the code actually writes: the DLL gets its
+    # log path from the module (log_file=<dir>ngb-dll.log), state.json and the
+    # two heartbeat files live in the same folder
+    check("install: printed paths match the runtime folder",
+          re.search(r"content\\ngb-presentation\\(ngb-dll\.log|state\.json|"
+                    r"heartbeat\.txt|render\.txt)", src) is not None)
     if os.path.exists(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat")):
         with open(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat"),
                   encoding="utf-8", errors="replace") as fh:
@@ -864,6 +883,13 @@ def dll_checks(verbose=False):
           "GetForegroundWindow" not in src_code and "WS_EX_TOOLWINDOW" in src_code)
     check("dll: exports NGB_Start / NGB_GetState",
           "__declspec(dllexport) int NGB_Start" in src and "NGB_GetState" in src)
+    # the memory helpers must be non-faulting: ReadProcessMemory/VirtualQuery,
+    # never a raw dereference of a caller-supplied address
+    check("dll: memory helpers use ReadProcessMemory / VirtualQuery",
+          "ReadProcessMemory(GetCurrentProcess()" in src
+          and "VirtualQuery(" in src
+          and "WriteProcessMemory(GetCurrentProcess()" in src)
+    check("dll: read length is capped", "len > (1u << 20)" in src)
     check("dll: releases size-dependent objects before ResizeBuffers",
           "ngb_gfx_shutdown_keep_hook()" in src and
           src.index("ngb_gfx_shutdown_keep_hook()") <
@@ -925,6 +951,9 @@ def dll_checks(verbose=False):
         check("dll: prebuilt DLL is x64", machine == 0x8664, hex(machine or 0))
         check("dll: prebuilt DLL exports the API",
               all(n in names for n in ("NGB_Start", "NGB_GetState", "NGB_Stop")),
+              ", ".join(names) or "no exports")
+        check("dll: prebuilt DLL exports the safe memory API",
+              all(n in names for n in ("NGB_Read", "NGB_Write", "NGB_Query")),
               ", ".join(names) or "no exports")
 
     # ---- rebuild from source --------------------------------------------

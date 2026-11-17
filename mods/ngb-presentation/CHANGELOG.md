@@ -303,6 +303,85 @@ and the C# overlay remains available.
 
 ---
 
+## 11. "The HUD kills the game" — a wrong address was an access violation
+
+**Symptom.** Rare but fatal: the game disappears with no error dialog, usually a
+few minutes into a match, sometimes when a match ends or a player is focused.
+Windows logs `0xc0000005` against `FL_2025.exe`.
+
+**Root cause.** 2.0.0 replaced the 1.x Win32 calls with Sider's `memory`
+library, on the assumption that it was the safer option. It is the opposite.
+Sider's `memory.lua` implements `memory.read` as:
+
+```lua
+function m.read(addr, len)
+    local p = ffi.cast('char*', addr)
+    return ffi.string(p, len)        -- raw dereference, no page check
+end
+```
+
+`ffi.string` on an unmapped address is an access violation — not a Lua error.
+Sider calls handlers through `lua_pcall`, but `pcall` only catches *Lua* errors;
+it cannot catch a segfault. And the module cannot `pcall` the read itself: the
+sandbox does not give modules `pcall` at all (§1 of TECHNICAL.md).
+
+The region map (`m.build_regions`) narrowed the window but could never close it:
+
+* regions were guessed — the image was assumed to span `base .. base+0x20000000`,
+  and a `±1 GiB` band was anchored on a Sider allocation. Neither is a real map;
+* a region can be freed between the check and the read (a match ending, a
+  stadium unloading, an allocation moving), and `m.load` had no second guard;
+* the scoreboard/stat pointers come from the *game*, so after a match they are
+  exactly the dangling pointers this design was supposed to handle.
+
+**Fix (2.0.1).** All memory access goes through the renderer DLL:
+
+```c
+__declspec(dllexport) unsigned int NGB_Read(unsigned long long addr, void *buf, unsigned int len)
+{
+    SIZE_T got = 0;
+    if (!buf || len == 0 || len > (1u << 20) || addr < 0x10000ULL) return 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)addr, buf, len, &got))
+        return (unsigned int)got;
+    return (unsigned int)got;
+}
+```
+
+`ReadProcessMemory` on your own process is the documented way to read an address
+that may not be mapped: it returns `FALSE` and a partial byte count instead of
+raising. `NGB_Query` (a `VirtualQuery` wrapper) replaces the guessed bands with
+the real committed/readable region list, and `NGB_Write` does the same for the
+replay-camera writes.
+
+Consequences, all deliberate:
+
+* **No DLL, no reads.** `renderer = overlay` or a DLL that failed to load means
+  no safe reader, so live player data is switched off and the HUD says
+  `memory reads: OFF (no safe backend)`. Score and clock still come from
+  `match.stats()`; goal cards still work.
+* **The unsafe reader is opt-in and loud.** `allow_unsafe_memory_reads = 1`
+  restores 2.0.0's behaviour and logs a `WARNING:` line naming the crash risk.
+* **Reads and writes are capped** at 1 MiB / 1 MiB, addresses below `0x10000`
+  are refused outright, and every failure returns "no data" rather than raising.
+
+**Verified here:**
+
+* `func: mem: load fails closed without a backend`, `… read_big …`, `… read_u32 …`
+  — with the backend set to `none`, all three return `nil`/`false` instead of
+  touching a pointer (tools/verify_mod.py);
+* `dll: memory helpers use ReadProcessMemory / VirtualQuery` — the shipped C
+  really uses the non-faulting calls, and `dll: read length is capped`;
+* `dll: prebuilt DLL exports the safe memory API` — `NGB_Read`, `NGB_Write`,
+  `NGB_Query` are present in the shipped binary;
+* `lua: unsafe reader is opt-in and warned about` — the raw path is reachable
+  only through the ini key and always logs the warning.
+
+**In game: UNVERIFIED** — that the crash is gone needs your machine. What can be
+stated is that the module no longer dereferences an address it has not validated,
+and that the remaining dereferences happen in C behind `ReadProcessMemory`.
+
+---
+
 ## Other changes in 2.0 (needed for the above)
 
 | change | why |
@@ -314,6 +393,8 @@ and the C# overlay remains available.
 | `publisher stats coherence` gate | see problem 7 |
 | `renderer = dll \| overlay \| none`, `dll_enabled`, `dll_selftest_hotkey`, `dll_diag_hotkey`, `dll_kill_hotkey` | the renderer is configurable and can be switched off without editing code |
 | `auto_launch_companion` removed | the module no longer starts a process (WinExec is gone); the DLL is loaded in-process |
+| `allow_unsafe_memory_reads` (new, default 0) | problem 11: memory reads require the DLL, the only non-faulting reader |
+| `NGB_Read` / `NGB_Write` / `NGB_Query` exports | problem 11: `ReadProcessMemory`/`WriteProcessMemory`/`VirtualQuery` on our own process |
 | install.bat copies the prebuilt DLL; no compiler step | problem 10, and no more `error CS...` dead ends |
 | uninstall.bat removes `ngb-render\` too | a clean removal; `sider.ini.ngb.bak` is left as a backup |
 | `tools/test_ini.bat` / `test_ini.ps1` | the add/remove/reinstall cycle, as an executable test |
