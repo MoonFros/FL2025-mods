@@ -282,6 +282,10 @@ def cs_checks():
     check("cs: single instance guard", "MoonFros.NGB.Overlay" in src)
     check("cs: heartbeat for the lua side", "overlay_alive.txt" in src)
     check("cs: stale state is dropped", "ReceivedAt > 0" in src and "10.0" in src)
+    check("cs: STAThread sits on Main, not on a field",
+          "[STAThread]\n        private static void Main" in src)
+    check("cs: no attribute above the version constant",
+          "[STAThread]\n        public const" not in src)
     check("cs: shot card shows the shot panel when telemetry exists",
           "bool analysis = style == 0 && ev.Shot != null" in src)
     check("cs: reads the data block", "\"player_stats\"" in src and "scorer_hook" in src)
@@ -524,6 +528,12 @@ def packaging_checks():
     check("install: builds + starts the overlay", "start_ngb_overlay.bat" in low)
     check("install: writes a log", "install_log.txt" in low)
     check("install: mentions match-stats in the manual fallback", "match-stats.enabled" in low)
+    check("install: stops when the overlay does not compile",
+          "build_failed" in low and "install incomplete" in low)
+    with open(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat"),
+              encoding="utf-8", errors="replace") as fh:
+        starter = fh.read().lower()
+    check("start script: warns about a stale exe", "older ngb_overlay.exe" in starter)
     check("install: creates the runtime state folder",
           re.search(r"content\\ngb-presentation", src) is not None
           and "mkdir" in low)

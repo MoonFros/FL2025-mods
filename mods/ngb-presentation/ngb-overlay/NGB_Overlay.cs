@@ -2462,9 +2462,9 @@ namespace Ngbfc.Presentation
             catch { }
         }
 
-        [STAThread]
-        public const string VERSION = "1.3.0";
+        public const string VERSION = "1.3.1";
 
+        [STAThread]
         private static void Main(string[] args)
         {
             try { Native.SetProcessDPIAware(); } catch { }

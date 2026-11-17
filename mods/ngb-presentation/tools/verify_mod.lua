@@ -787,6 +787,16 @@ local beat_state = m._test.state()
 check("heartbeat: reported in state.json",
       beat_state.status.data.overlay_alive == true,
       tostring(beat_state.status.data.overlay_alive))
+
+-- a stale exe must be called out, not silently trusted
+local txt = m.overlay_text()
+check("heartbeat: stale exe version is reported", string.find(txt, "STALE", 1, true) ~= nil,
+      (string.match(txt, "OVERLAY%s+STALE[^\n]*") or ""))
+m.overlay_info = { version = m.VERSION, pid = 1, up = 1 }
+txt = m.overlay_text()
+check("heartbeat: matching version is reported as running",
+      string.find(txt, "OVERLAY   running", 1, true) ~= nil,
+      (string.match(txt, "OVERLAY%s+running[^\n]*") or ""))
 if cdir then os.remove(cdir .. "/overlay_alive.txt") end
 
 return RESULTS

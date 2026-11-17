@@ -174,9 +174,14 @@ rem ---------------------------------------------------------------------------
 rem  4. build + start the overlay
 rem ---------------------------------------------------------------------------
 echo.
+set "BUILD=ok"
 if exist "%SIDER%\ngb-overlay\Start_NGB_Overlay.bat" (
     call "%SIDER%\ngb-overlay\Start_NGB_Overlay.bat"
+    if errorlevel 1 set "BUILD=failed"
+) else (
+    set "BUILD=missing"
 )
+if /i not "%BUILD%"=="ok" goto build_failed
 
 rem ---------------------------------------------------------------------------
 rem  5. done
@@ -198,8 +203,27 @@ echo   Uninstall: run uninstall.bat from this folder.
 echo ==================================================================
 >> "%LOG%" echo INSTALL OK
 echo.
-pause
 exit /b 0
+
+:build_failed
+echo.
+echo ==================================================================
+echo   INSTALL INCOMPLETE  -  the overlay did not compile
+echo.
+echo   The Sider module is registered and sider.ini is configured, so the
+echo   game side is fine. Only the graphic overlay is missing.
+echo.
+echo   Scroll up for the compiler messages (they start with "error CS").
+echo   Nothing above has to be deleted: fix or report the error, then run
+echo   install.bat again.
+echo.
+echo   The Sider overlay will read:  OVERLAY NOT RUNNING
+echo   Log: %LOG%
+echo ==================================================================
+>> "%LOG%" echo INSTALL INCOMPLETE - overlay build failed
+echo.
+pause
+exit /b 1
 
 rem ---------------------------------------------------------------------------
 :try

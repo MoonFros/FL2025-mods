@@ -31,10 +31,11 @@ if not exist "%CSC%" (
     echo  [X] csc.exe not found - .NET Framework 4.x is missing on this system.
     echo      Install ".NET Framework 4.8" from Windows Update and try again.
     if exist "NGB_Overlay.exe" (
-        echo      Starting the previously built NGB_Overlay.exe instead.
+        echo      WARNING: starting an OLDER NGB_Overlay.exe instead
+        for %%F in ("NGB_Overlay.exe") do echo      (built %%~tF) - the Sider overlay will say "OVERLAY STALE".
         start "" "NGB_Overlay.exe"
         timeout /t 3 >nul
-        exit /b 0
+        exit /b 1
     )
     pause
     exit /b 1
@@ -49,12 +50,19 @@ echo  Compiling NGB_Overlay.exe ...
 
 if errorlevel 1 (
     echo.
-    echo  [X] Build failed - see the compiler messages above.
+    echo  [X] Build failed - the compiler messages are above.
+    echo      Copy them into a message; the overlay cannot start without them.
     if exist "NGB_Overlay.exe" (
-        echo      Starting the previously built NGB_Overlay.exe instead.
+        echo.
+        echo      WARNING: an OLDER NGB_Overlay.exe is present and will start
+        echo      instead. It does not contain the current fixes, and the Sider
+        echo      overlay will label it "OVERLAY STALE".
+        for %%F in ("NGB_Overlay.exe") do echo      that exe was built %%~tF
+        echo      Delete NGB_Overlay.exe if you would rather see nothing than
+        echo      an old build.
         start "" "NGB_Overlay.exe"
-        timeout /t 3 >nul
-        exit /b 0
+        timeout /t 4 >nul
+        exit /b 1
     )
     pause
     exit /b 1

@@ -28,7 +28,7 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "1.3.0"
+m.VERSION = "1.3.1"
 m.STATE_VERSION = 3
 
 -- ============================================================================
@@ -2904,8 +2904,14 @@ function m.overlay_text()
         out[#out + 1] = "ENGINE   waiting for a match (scoreboard returns nothing yet)"
     end
     local alive = (now_ms() - (m.overlay_seen or 0)) < 6000
-    if alive then
-        local inf = m.overlay_info or {}
+    local inf = m.overlay_info or {}
+    if alive and inf.version and inf.version ~= m.VERSION then
+        -- the exe is older than the module: the exact situation that makes new
+        -- fixes look like they were never applied
+        out[#out + 1] = string.format(
+            "OVERLAY   STALE %s, module is %s  ->  run install.bat again",
+            inf.version, m.VERSION)
+    elseif alive then
         out[#out + 1] = string.format("OVERLAY   running %s   (cards draw over the game)",
             inf.version or "")
     else

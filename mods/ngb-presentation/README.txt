@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.3.0
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.3.1
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: goal cards with the real
@@ -299,6 +299,17 @@ and nothing is filled with zeros to look complete.
       probe_region.bin. Until the table validates, the cards stay clean instead
       of printing zeros.
 
+  "error CS..." when running install.bat
+    - The overlay did not compile, so install.bat now stops with
+      INSTALL INCOMPLETE. The Sider module is still installed. Copy the error
+      lines into a message - that is the fastest way to get a fix.
+    - If an older NGB_Overlay.exe exists, the start script warns that it is
+      running an old build; delete ngb-overlay\NGB_Overlay.exe to be sure.
+
+  The Sider overlay says "OVERLAY STALE x.y.z"
+    - The exe on disk is older than the module. Run install.bat again (it
+      rebuilds it); if the build fails, the compiler message tells you why.
+
   "WARNING: LuaJIT FFI is off" in sider.log
     - Add luajit.ext.enabled = 1 to sider.ini (install.bat does this).
 
@@ -355,6 +366,17 @@ and nothing is filled with zeros to look complete.
 --------------------------------------------------------------------------------
 11. CHANGES
 --------------------------------------------------------------------------------
+
+  1.3.1  The overlay actually compiles again.
+         - 1.1.0 - 1.3.0 put [STAThread] on the version constant instead of on
+           Main, so csc refused the file: no exe was ever produced and every
+           fix since 1.1.0 was invisible for that reason alone
+         - install.bat now stops with INSTALL INCOMPLETE and the compiler
+           messages instead of announcing success
+         - Start_NGB_Overlay.bat warns loudly when it falls back to an older
+           exe (and prints when that exe was built)
+         - the Sider overlay reports "OVERLAY STALE <version>" when the exe is
+           older than the module, which is the other way this can look broken
 
   1.3.0  Made visible and de-duplicated.
          - the overlay finds the game window by name OR falls back to the
