@@ -389,7 +389,7 @@ Small (~1.5 KB) so a reader can never be more than one frame behind.
 ```json
 {
   "v": 2, "seq": 842, "ts": 918273,
-  "module": "Next-Gen Broadcast", "version": "1.0.0",
+  "module": "Next-Gen Broadcast", "version": "1.0.1",
   "hud": { "enabled": true, "master": true, "style": 0, "analysis": true,
            "units": "metric", "scorebug": false,
            "credit": "MOONFROS PRESENTS", "author": "MoonFros",

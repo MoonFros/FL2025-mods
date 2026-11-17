@@ -1,10 +1,11 @@
 -- ============================================================================
---  EA FC 27 HyperMotion Broadcast & Replay Telemetry
---  Sider Lua module for PES 2021 / SmokePatch Football Life 2025 (FL_2025.exe)
+--  NEXT-GEN FOOTBALL BROADCAST PRESENTATION
+--  MOONFROS PRESENTS  -  created by MoonFros
+--  Sider Lua module for Football Life 2025 (FL_2025.exe, PES 2021 engine)
 --
---  Feature 1 : HyperMotion goal replay camera + live shot telemetry
---  Feature 2 : Goal / miss / save player popup with match shots + G/A
---  Feature 3 : Post-match Man of the Match full stat card
+--  Feature 1 : cinematic goal replay camera + live shot analysis
+--  Feature 2 : player spotlight for goals, shots, saves and misses (G/A/shots)
+--  Feature 3 : full-time Man of the Match reveal
 --
 --  Target : Sider 7.3.4 (LuaJIT 2.1, x64), FL_2025.exe v1.0, PES 2021 v1.7.x
 --  Output : content\ngb-presentation\state.json  ->  NGB_Overlay.exe (C# HUD)
@@ -27,7 +28,7 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "1.0.0"
+m.VERSION = "1.0.1"
 m.STATE_VERSION = 2
 
 -- ============================================================================
@@ -1277,7 +1278,7 @@ local function scan_sections(patterns)
 end
 
 local CAM_TARGETS = {
-    [1] = { h0 = 0.28, h3 = 0.95, zoom = 0.56 },   -- HyperMotion low sweep
+    [1] = { h0 = 0.28, h3 = 0.95, zoom = 0.56 },   -- cinematic low sweep
     [2] = { h0 = 0.62, h3 = 1.45, zoom = 0.82 },   -- elevated broadcast
     [3] = nil,
 }
@@ -1286,7 +1287,7 @@ function m.cam_init()
     local enabled = cfg_i("replay_camera_enabled", 1) ~= 0
     m.cam.preset = clamp(cfg_i("replay_camera_preset", 1), 1, 3)
 
-    -- preset 1 is the HyperMotion sweep and its three values are tunable
+    -- preset 1 is the cinematic sweep and its three values are tunable
     CAM_TARGETS[1] = {
         h0 = clamp(cfg_f("replay_height_cam0", 0.28), 0.02, 2.0),
         h3 = clamp(cfg_f("replay_height_cam3", 0.95), 0.02, 4.0),
@@ -1669,7 +1670,7 @@ m.milestone_for = milestone_for
 
 local function team_of(side)
     local t = m.match[side == 0 and "home" or "away"]
-    return { name = t.name, abbr = t.abbr, color = t.color or "#AEFF00", side = side }
+    return { name = t.name, abbr = t.abbr, color = t.color or "#D8F26B", side = side }
 end
 
 -- Accumulated per player "broadcast" extras (peak shot speed, total xG).
@@ -2057,7 +2058,7 @@ local function build_state(now)
             team = {
                 name = (ev.team and ev.team.name) or "",
                 abbr = (ev.team and ev.team.abbr) or "",
-                color = (ev.team and ev.team.color) or "#AEFF00",
+                color = (ev.team and ev.team.color) or "#D8F26B",
             },
             stats = {
                 shots = s.shots or 0,
