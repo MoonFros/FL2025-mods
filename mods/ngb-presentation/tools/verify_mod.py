@@ -788,6 +788,48 @@ def packaging_checks():
         check("docs: CHANGELOG names all ten problems",
               all(("## %d." % i) in chg for i in range(1, 11)),
               ", ".join(str(i) for i in range(1, 11) if ("## %d." % i) not in chg))
+        # INSTALL.txt is the "explain it like I am five" guide. It has to match what
+    # the installer and the ini actually do - a friendly guide that is wrong is
+    # worse than no guide.
+    inst_txt = os.path.join(ROOT, "INSTALL.txt")
+    if not os.path.exists(inst_txt):
+        check("docs: INSTALL.txt present", False, inst_txt)
+    else:
+        check("docs: INSTALL.txt present", True)
+        raw = open(inst_txt, "rb").read()
+        guide = raw.decode("utf-8", "replace")
+        check("docs: INSTALL.txt is plain ASCII (opens in old Notepad)",
+              all(b < 128 for b in raw), "non-ascii byte present")
+        check("docs: INSTALL.txt uses CRLF line endings", b"\r\n" in raw)
+        check("docs: INSTALL.txt names the three sider.ini lines",
+              all(k in guide for k in ("luajit.ext.enabled = 1",
+                                       "match-stats.enabled = 1",
+                                       'lua.module = "NGB_Presentation.lua"')))
+        check("docs: INSTALL.txt tells the user to double-click install.bat",
+              "install.bat" in guide and "uninstall.bat" in guide)
+        check("docs: INSTALL.txt shows where the files go",
+              all(k in guide for k in ("ngb-render\\NGB_Render.dll",
+                                       "modules\\NGB_Presentation.lua",
+                                       "sider.ini")))
+        check("docs: INSTALL.txt explains the F8 self-test",
+              "F8" in guide and "DEMO - NOT REAL DATA" in guide)
+        check("docs: INSTALL.txt documents F7 / F12",
+              "F7" in guide and "F12" in guide)
+        # facts that changed once already: the log path and the digit hotkeys
+        check("docs: INSTALL.txt gives the real install_log.txt location",
+              "install_log.txt" in guide
+              and "Sider\\install_log.txt" not in guide)
+        check("docs: INSTALL.txt warns that 7/8/9 need the overlay by default",
+              "hotkeys_overlay_only" in guide)
+        ini_txt = read(os.path.join(ROOT, "modules", "NGB_Presentation.ini"))
+        check("docs: INSTALL.txt matches the ini's default for the digits",
+              ("hotkeys_overlay_only = 1" in ini_txt) ==
+              ("hotkeys_overlay_only = 1" in guide))
+        check("docs: INSTALL.txt keeps the safety default",
+              "allow_unsafe_memory_reads" in guide and "leave it at 0" in guide)
+        check("docs: INSTALL.txt says the in-game part is untested",
+              "not been tested" in guide)
+
         check("docs: README has the WHY-NOTHING-SHOWS checklist",
               "WHY NOTHING SHOWS" in doc.upper())
         check("docs: README documents the renderer hotkeys",

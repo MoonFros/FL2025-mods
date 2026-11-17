@@ -31,6 +31,10 @@ or says `PLAYER DATA UNAVAILABLE` / `SCORER NOT AVAILABLE`.
 
 ## Install (3 steps, no compiler)
 
+> **Never installed a Sider mod before?** Read **`INSTALL.txt`** instead — same
+> steps, plain English, with the `sider.ini` lines explained and an ordered
+> "it isn't showing" list.
+
 1. Double-click **`install.bat`** (or drag your Sider folder onto it).
    It finds Sider on any drive, copies `modules\`, `ngb-render\NGB_Render.dll`
    and (optionally) the C# fallback, backs up `sider.ini` to

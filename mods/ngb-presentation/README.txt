@@ -3,6 +3,9 @@
   MOONFROS PRESENTS
   Created by MoonFros
   For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.1
+
+  First time? INSTALL.txt in this folder explains the same thing in plain
+  English, step by step, including the sider.ini lines.
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: goal cards with the real

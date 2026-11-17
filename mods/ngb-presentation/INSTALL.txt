@@ -1,0 +1,266 @@
+================================================================================
+  NEXT-GEN BROADCAST  -  HOW TO INSTALL IT  (the very simple version)
+  MoonFros Presents  -  for Football Life 2025 / PES 2021, with Sider 7
+  Version 2.0.1
+================================================================================
+
+Read this top to bottom. It is written in order. Do not skip step 2.
+
+There is nothing to build, nothing to compile, no extra window, and no admin
+password. If someone told you to type "dotnet build" or "csc", that is an old
+version of this mod. Ignore it.
+
+
+--------------------------------------------------------------------------------
+  1. WHAT YOU NEED BEFORE YOU START
+--------------------------------------------------------------------------------
+
+  [ ] Windows, 64-bit. (This mod is for the PC game only.)
+
+  [ ] Football Life 2025 installed and working. You can start a match without
+      this mod. If the game itself does not run, fix that first.
+
+  [ ] Sider 7 installed and working. Sider is the little program that starts
+      the game and loads mods called "modules". You must already use Sider
+      for other mods, or at least have it running.
+      You can tell it works when starting the game through Sider.exe opens
+      the game normally.
+
+  [ ] This mod's folder. It is the folder you are reading this file from.
+      It must contain these three things:
+
+            install.bat                       <-- you will double-click this
+            modules\NGB_Presentation.lua      <-- the mod itself
+            ngb-render\NGB_Render.dll         <-- the part that draws on screen
+
+      If ngb-render\NGB_Render.dll is missing, download the mod again. Without
+      that file nothing can be drawn. Do not continue.
+
+
+--------------------------------------------------------------------------------
+  2. WHERE IS YOUR SIDER FOLDER?
+--------------------------------------------------------------------------------
+
+  This is the only step that confuses people, so here it is slowly.
+
+  Sider is a folder. Inside it there is a file called "sider.ini" and a folder
+  called "modules". It looks like this:
+
+        Football Life 2025\          <-- the game folder
+            FL_2025.exe
+            Sider\                   <-- THIS is the Sider folder
+                Sider.exe
+                sider.ini            <-- the text file we will talk about
+                modules\             <-- mods live here
+                content\
+                ngb-render\           (this one gets created for you)
+
+  So: find the folder that has "sider.ini" inside it. That is your Sider
+  folder. You will need it in step 3.
+
+  Tip: if you do not know where it is, open the shortcut you use to start the
+  game, right-click it, choose "Open file location", and look around for
+  Sider.exe.
+
+
+--------------------------------------------------------------------------------
+  3. INSTALL IT  (one double-click)
+--------------------------------------------------------------------------------
+
+  3a. Close the game. Close Sider. (The files cannot be replaced while they
+      are in use.)
+
+  3b. Double-click "install.bat".
+
+      That is the whole installation.
+
+      If your PC asks "Do you want to allow this app...", choose Yes.
+      If Windows Defender says it does not recognise the file, choose
+      "More info" then "Run anyway". It is a text file with commands in it;
+      you can open it in Notepad and read every line if you want.
+
+  3c. Follow the black window. It will:
+        - find your Sider folder (or ask you for it),
+        - copy modules\NGB_Presentation.lua and modules\NGB_Presentation.ini,
+        - copy ngb-render\NGB_Render.dll,
+        - add three lines to sider.ini (see step 4),
+        - tell you INSTALLATION COMPLETE.
+
+  3d. If the window says it could NOT find your Sider folder, do this instead:
+        drag your Sider folder with the mouse and drop it ONTO install.bat.
+      That tells the installer exactly where to put the files.
+
+  3e. If it says "Could not edit sider.ini automatically", it will open the
+      file in Notepad and put the three lines on your clipboard. Go to step 4
+      and paste them by hand. That is normal on locked-down PCs.
+
+  3f. Start the game through Sider, the same way you always do.
+
+
+--------------------------------------------------------------------------------
+  4. THE sider.ini PART  (what those three lines mean)
+--------------------------------------------------------------------------------
+
+  sider.ini is a plain text file. It is a list of instructions for Sider.
+  Open it with Notepad (right-click -> Open with -> Notepad).
+
+  The mod needs these three lines in it:
+
+        luajit.ext.enabled = 1
+        match-stats.enabled = 1
+        lua.module = "NGB_Presentation.lua"
+
+  You do not need to type them - install.bat adds them for you. But you should
+  know what they do, because these are the three things that go wrong:
+
+    luajit.ext.enabled = 1
+        Turns on the part of Sider that lets a module load a DLL.
+        Without it the module cannot load ngb-render\NGB_Render.dll, so
+        nothing is drawn. If this line says "= 0", nothing will ever show.
+
+    match-stats.enabled = 1
+        Turns on Sider's scoreboard feed. This is where the score, the clock
+        and the goal events come from. Without it the cards will not know a
+        goal happened.
+
+    lua.module = "NGB_Presentation.lua"
+        Tells Sider to actually start this mod. Without this line the mod
+        files just sit there and do nothing.
+
+  Rules for editing sider.ini by hand:
+
+    - It is one line per instruction. No commas, no brackets.
+    - Do not delete lines that are already there. Add, do not replace.
+    - "lua.module" may appear several times - once per mod. That is correct.
+      Add yours next to the others.
+    - Save the file (Ctrl+S) and close Notepad before starting the game.
+    - If you make a mess: install.bat keeps a backup called
+      sider.ini.ngb.bak. You can copy that back over sider.ini.
+
+  Where do the files end up? After a normal install your Sider folder looks
+  like this:
+
+        Sider\
+            sider.ini
+            modules\
+                NGB_Presentation.lua       <-- added by the installer
+                NGB_Presentation.ini       <-- added by the installer
+            ngb-render\
+                NGB_Render.dll             <-- added by the installer
+            content\
+                ngb-presentation\          <-- created when the game runs
+                    state.json             (what the mod wants drawn)
+                    heartbeat.txt          (proof the mod is alive)
+                    render.txt             (proof the drawer is alive)
+                    ngb-dll.log            (the drawer's diary)
+
+  The installer never deletes anything and never rewrites other lines in
+  sider.ini.
+
+
+--------------------------------------------------------------------------------
+  5. HOW TO KNOW IT WORKED  (10 seconds)
+--------------------------------------------------------------------------------
+
+  1. Start the game through Sider.
+  2. Get to any menu or into a match.
+  3. Press F8.
+
+  A card appears on screen that says:   DEMO - NOT REAL DATA
+
+      Card appears      -> GOOD. The installation is correct. Start a match
+                           and enjoy it.
+
+      Nothing appears   -> The mod is installed but the drawing part is not
+                           running. Go to step 7.
+
+
+--------------------------------------------------------------------------------
+  6. THE KEYS
+--------------------------------------------------------------------------------
+
+  In the game:
+
+    F8    test card (the "DEMO - NOT REAL DATA" one)
+    F7    a small panel with numbers about what the mod is doing
+    F12   cards on / off, right now, without restarting the game
+
+    [7]   change presentation style
+    [8]   presentation on / off
+    [9]   shot analysis on / off
+
+  F12 is the "make it stop" key. If something looks wrong on screen, press
+  F12. The game keeps running.
+
+  One detail about 7 / 8 / 9: by default they only work while the Sider
+  overlay is open (the small text Sider itself puts in the corner), so they
+  never fight with the game's own keys. If you want them to work during play,
+  open  Sider\modules\NGB_Presentation.ini  in Notepad and change
+
+        hotkeys_overlay_only = 1      to      hotkeys_overlay_only = 0
+
+  The game will then also see those keys, which is usually fine. F8, F7 and
+  F12 always work, everywhere.
+
+
+--------------------------------------------------------------------------------
+  7. IF IT DOES NOT WORK  (check in this order)
+--------------------------------------------------------------------------------
+
+  A. Press F8 again, in a match, not in the settings screens.
+
+  B. Is there a file called ngb-dll.log in
+        Sider\content\ngb-presentation\
+     - No file at all? The module never even tried to load the drawer.
+       Check step 4: luajit.ext.enabled = 1 and lua.module = "..." must both
+       be in sider.ini, and the game must be started through Sider.
+     - A file with "NO DLL at ..." inside? The DLL is in the wrong place.
+       It belongs in  Sider\ngb-render\NGB_Render.dll (not in modules, not in
+       content). Copy it there.
+     - A file with "hooks installed" inside? Then the drawing part is alive.
+       If F8 still shows nothing, send that file to me.
+
+  C. Freeze or crash when a match ends? Update to 2.0.1 or newer - that exact
+     problem was found and fixed. (This file is 2.0.1.)
+
+  D. Player numbers say "UNAVAILABLE"? That is on purpose when the mod has no
+     safe way to read memory. It means ngb-render\NGB_Render.dll is not
+     loaded. The score, clock and goal cards still work without it.
+     Do NOT go looking for "allow_unsafe_memory_reads" - leave it at 0.
+
+  E. Still stuck? Send me these three files and I can tell you what happened:
+        Sider\sider.log
+        Sider\content\ngb-presentation\ngb-dll.log
+        install_log.txt      (in this mod folder, next to install.bat)
+     They are text files. No personal information is in them.
+
+
+--------------------------------------------------------------------------------
+  8. HOW TO REMOVE IT
+--------------------------------------------------------------------------------
+
+  Double-click "uninstall.bat" and answer Yes.
+
+  It removes the module, the DLL and its own three lines from sider.ini. It
+  leaves a backup of sider.ini called sider.ini.ngb.bak, and it does not touch
+  any other mod. Nothing else on your PC changes.
+
+
+--------------------------------------------------------------------------------
+  9. ONE HONEST NOTE
+--------------------------------------------------------------------------------
+
+  The installation, the copying and the sider.ini editing are tested and are
+  plain files - there is nothing clever happening there.
+
+  The in-game part (drawing on top of the game, exclusive fullscreen on your
+  graphics card) has not been tested on your PC by me. Nobody can test that
+  without your game and your graphics driver. That is why F8 exists, and why
+  F12 exists. If F8 shows the DEMO card, the drawing part works. If it does
+  not, step 7 tells you where to look - and the mod will never stop you from
+  playing the game.
+
+================================================================================
+  That is everything. Double-click install.bat, press F8, look for the card.
+  MoonFros
+================================================================================
