@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.2
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.3
 
   First time? INSTALL.txt in this folder explains the same thing in plain
   English, step by step, including the sider.ini lines.
@@ -329,8 +329,22 @@ and nothing is filled with zeros to look complete.
                                          file belongs in <Sider>\ngb-render\.
          "ffi off" ..................... add luajit.ext.enabled = 1 to sider.ini.
          "LoadLibraryA failed" ......... wrong/32-bit file, or blocked by AV.
-         "hooks installed: Present=..." the renderer is live. If F8 still shows
-                                         nothing, send me this file.
+         "waiting for the game to create    normal in the first seconds. The
+          its swapchain" ................. drawer stands at the door and waits
+                                         for the game to open a picture. Start
+                                         a match; the line then changes to
+                                         the one below.
+         "hooks installed via the game's    the renderer is live. If F8 still
+          own swapchain: Present=..." .... shows nothing, send me this file.
+         "no route to the swapchain         none of the routes found the game's
+          worked" ........................ picture. The game is untouched; send
+                                         me this file. The "hr=0x..." lines
+                                         above it are the reason.
+
+  NOTE  In 2.0.3, "the drawer is loaded but has not found the picture yet" is
+        a normal, harmless state - it is not an installation error. The panel
+        says "DLL loaded, NOT hooked (...)" and the DLL keeps retrying in the
+        background.
          "FATAL: exception 0x... " ..... the renderer caught its own fault and
                                          switched itself off. The game keeps
                                          running. Send me that line.
@@ -393,9 +407,9 @@ and nothing is filled with zeros to look complete.
 
   Nothing shows when the game is NOT focused
     That is the case this version was rebuilt for. If it still happens:
-      - check ngb-dll.log for "hooks installed" (if the hook is not in, the
-        fallback window was used, and the fallback only draws on a window it can
-        identify);
+      - check ngb-dll.log for "hooks installed" (2.0.3: "hooks installed via
+        the game's own swapchain"). If the hook is not in, the fallback window
+        was used, and the fallback only draws on a window it can identify;
       - press F8 while the game is unfocused. The self-test card is drawn from
         the same Present call as everything else, so if F8 works the renderer is
         fine and the cards are simply not being fed data (step 3).
@@ -444,6 +458,21 @@ and nothing is filled with zeros to look complete.
 11. CHANGES
 --------------------------------------------------------------------------------
 
+  2.0.3  THE FIX FOR "IT SAYS THE DLL IS NOT INSTALLED, BUT IT IS".
+         2.0.2 found the game's picture one way only: by building a
+         throw-away Direct3D device at start-up and reading the functions off
+         it. A module runs before the game has started Direct3D, so that can
+         fail - and on your machine it did, on the video card and on the
+         software renderer both. The DLL then wrote "hooks not installed", the
+         panel repeated it as "not configured or installed", and nothing was
+         ever drawn.
+         Now the DLL also hooks the call the game uses to create its picture,
+         waits for it, and hooks that picture. Retries run in the background
+         (0.5 s, then 2 s, then 5 s) for as long as the game runs, so "not
+         yet" no longer means "never". The panel prints which route it is on
+         plus the error codes, and a failed route never touches or slows the
+         game. Host tests cover the retry schedule.
+         In game: still UNVERIFIED - the log will say which route worked.
   2.0.2  THE FIX THAT MAKES THE RENDERER ACTUALLY WORK. 2.0.0 and 2.0.1
          called the DLL's functions through raw pointers from
          GetProcAddress, which LuaJIT refuses ("'void' is not callable"), so

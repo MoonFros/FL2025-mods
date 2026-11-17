@@ -515,6 +515,72 @@ NGB_Start() called` and `ngb-dll.log` should appear the moment a match starts.
 
 ---
 
+## 14. "Not configured or installed" — the DLL was loaded, but never hooked a frame
+
+**Reproduced — from your `ngb-dll.log`.** Two sessions (pids 3232 and 8600),
+both of them said `could not create a probe swapchain - hooks not installed`,
+then `renderer NOT active - the game runs normally, nothing is drawn`. The same
+log shows the config was read correctly (`enabled=1`, the hotkeys were parsed)
+and that `NGB_Start` was reached. So the DLL *was* loaded and *was* called. The
+panel's wording was the lie: it reported a missing DLL when the truth was "the
+DLL is here, it just never got into a frame".
+
+**Why the probe failed.** 1.x learned the swapchain functions by building a
+throw-away Direct3D device plus swapchain (`D3D11CreateDeviceAndSwapChain`) and
+reading the function table off it. That is a fine trick *after* the game has
+started Direct3D — but a Sider module runs at start-up, before the game has
+created any device. On your machine the call failed, and it failed again on the
+software rasteriser (WARP). The old code tried once, at the worst possible
+moment, and gave up for the rest of the session.
+
+**Fixed.** Hooking no longer depends on that probe:
+
+1. **New route — the game's own swapchain.** The DLL now hooks
+   `IDXGIFactory::CreateSwapChain` and `CreateSwapChainForHwnd`
+   (slots 10 and 11 of the factory's table, taken from `CreateDXGIFactory1`) and
+   simply *waits*. When the game builds its swapchain, the DLL sees it, hooks
+   `Present` and `ResizeBuffers` on that real swapchain, and switches the
+   create-hooks off. This needs no device of our own, which is exactly why it
+   works where the probe cannot.
+2. **The probe is still there, as one route of several.** Hardware first, then
+   WARP (cheap when it works). Six attempts at most, so a failing probe cannot
+   cost anything after the game has started.
+3. **Retries instead of "give up".** The background thread retries every 0.5 s
+   for the first few attempts, then every 2 s, then every 5 s, for as long as
+   the game runs. "Not yet" is no longer reported as "never".
+4. **`NGB_Start` never returns 0 for "not hooked yet".** Returning 0 made the
+   Lua module fall back to the C# window, which draws nothing — a small lie that
+   caused a second symptom. It now returns 1 and the *state* carries the truth.
+5. **The diagnostics say which route is in force.** `NGB_GetState` now reports
+   `hook_plan=` (`not-tried`, `probe-hardware`, `probe-warp`, `factory`,
+   `hooked`, `gave-up`), `hook_tries=`, and the two HRESULTs (`hr_hw=`,
+   `hr_warp=`). The panel prints `DLL loaded, NOT hooked (factory after 3
+   tries)` instead of accusing you of not installing it, plus a `hooking: …`
+   line with the HRESULTs.
+6. **A wrong slot is refused, not hooked.** Before hooking a function table
+   entry, the DLL checks that the address really is inside `dxgi.dll`. One wrong
+   index would hook a random function, and that is a crash rather than a missing
+   card.
+
+**Verified.** New host test `tests/plan_test.c` (59 checks, no Windows needed)
+proves the state names and the retry schedule — including that the delay never
+decreases and never reaches zero (a zero-delay retry loop would spin a core).
+`verify_mod.py` adds seven gates for the above, including "`NGB_Start` contains
+no `return 0`" and "a vtable slot is only hooked inside dxgi.dll". Suite is
+521/521.
+
+**In game: UNVERIFIED.** What to look for in `ngb-dll.log` after updating:
+
+* `hooks installed via the game's own swapchain: Present=… ResizeBuffers=…`
+  — the good case; cards should be on screen.
+* `waiting for the game to create its swapchain (factory hook is in place)`
+  — normal early on; it becomes the line above once a match loads.
+* `no route to the swapchain worked - nothing will be drawn. Send this log; the
+  HRESULTs above say why.` — the honest failure, and the HRESULTs above it are
+  what is needed to fix it.
+
+---
+
 ## Other changes in 2.0 (needed for the above)
 
 | change | why |
@@ -536,6 +602,7 @@ NGB_Start() called` and `ngb-dll.log` should appear the moment a match starts.
 ## What is still missing / not done
 
 * **In-game acceptance run.** Not performed — cannot be performed here.
+  (This release is 2.0.3; problem 14 is the reason it exists.)
 * **Per-player stat offsets for FL_2025.exe.** Still unproven, still off by
   default. `tools/decode_probe.py` + `calibration.txt` exist so you can pin the
   layout without editing code. What *is* now proven: the tool runs end to end
