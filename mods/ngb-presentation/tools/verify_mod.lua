@@ -398,7 +398,7 @@ check("goal: card appears after the delay",
 -- state.json
 clock_ms = clock_ms + 200; m.tick(clock_ms)
 local state = m._test.state()
-check("state: schema version", state.v == 3, state.v)
+check("state: schema version", state.v == 4, state.v)
 check("state: hud master flag", state.hud.master ~= nil, tostring(state.hud.master))
 check("state: hud style", state.hud.style ~= nil, tostring(state.hud.style))
 check("state: hud analysis flag", state.hud.analysis ~= nil, tostring(state.hud.analysis))
@@ -526,7 +526,7 @@ m._test.set_region(0, 0)
 m._test.reset()
 clock_ms = clock_ms + 400; m.tick(clock_ms)
 check("no stats region: tick survives", true)
-check("no stats region: state still valid", m._test.state().v == 3)
+check("no stats region: state still valid", m._test.state().v == 4)
 
 -- context reset clears everything
 m.on_context_reset(CTX)

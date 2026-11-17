@@ -7,20 +7,41 @@
 --  Feature 2 : player spotlight for goals, shots, saves and misses (G/A/shots)
 --  Feature 3 : full-time Man of the Match reveal
 --
---  Target : Sider 7.3.4 (LuaJIT 2.1, x64), FL_2025.exe v1.0, PES 2021 v1.7.x
---  Output : content\ngb-presentation\state.json  ->  NGB_Overlay.exe (C# HUD)
---           Sider overlay text (overlay_on)    ->  fallback in-game overlay
+--  Target : Sider 7.4.x (LuaJIT 2.1, x64), FL_2025.exe (PES 2021 engine v1.7.x)
+--  Output : content\ngb-presentation\state.json   -> NGB_Render.dll (in-game D3D11)
+--           content\ngb-presentation\heartbeat.txt -> liveness proof
+--           Sider overlay text (overlay_on)         -> last-resort fallback
 --
---  Module sandbox notes (Sider 7.3.4):
---    * globals available: string math table io os(time/clock/date) tonumber
---      tostring type pairs ipairs unpack error assert collectgarbage log
---      memory fs audio match zlib  (+ ffi bit when luajit.ext.enabled = 1)
---    * pcall / xpcall / require / select / next are NOT available.
---      => every failure path must be an explicit nil check, never a pcall.
---    * the module chunk must RETURN a table that has an init(ctx) method, and
---      every registered callback is kept as a field of that table (m.xxx) so
---      the module table stays reachable from Sider's main lua_State.
--- ============================================================================
+--  ---------------------------------------------------------------------------
+--  SANDBOX - verified against the Sider 7.4 source (sider.cpp push_env_table),
+--  not assumed. Do not "correct" this list from memory.
+--
+--    globals: assert table pairs ipairs string math tonumber tostring unpack
+--             error _VERSION type io collectgarbage jit  (+ os/time,clock,date
+--             only)  (+ ffi, bit when luajit.ext.enabled = 1)
+--    NOT available at all: print, setmetatable, getmetatable, rawset, rawget,
+--             rawequal, coroutine, debug, package, dofile, loadfile, load,
+--             loadstring, require, next, select, pcall, xpcall, _ENV
+--    libraries in the env but NOT global: log, memory, fs, zlib, audio, match,
+--             input, _FILE, _G
+--
+--  Consequences that shape this whole file:
+--    * pcall/xpcall do not exist -> there is no way to catch an error. Every
+--      risky call is therefore guarded by a capability check first, and by
+--      design nothing here is allowed to raise. A Lua error inside a Sider
+--      callback is caught by Sider itself (lua_pcall), so a mistake disables
+--      one handler - it does not crash the game.
+--    * pair() iteration is not guaranteed to hide anything, but rawset and
+--      next are missing, so all tables are built with plain assignment.
+--    * ffi must be read as a local BEFORE the module body, and the cdef must
+--      be idempotent (Sider hot-reloads a module by re-running the chunk and
+--      re-registering the file in the same lua_State).
+--
+--  Memory access: this module only ever uses Sider's own `memory` library
+--  (memory.read / memory.unpack), never FFI Win32 calls. memory.read is a
+--  plain memcpy inside the game process - no ReadProcessMemory, no
+--  VirtualQuery, no VirtualProtect - so there is no page that can fault.
+--  ============================================================================
 
 local m = {}
 
@@ -29,56 +50,39 @@ m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
 m.VERSION = "1.3.1"
-m.STATE_VERSION = 3
+m.STATE_VERSION = 4
 
 -- ============================================================================
--- 0. Optional LuaJIT FFI
+-- 0. Platform: Sider's memory library (no FFI, no Win32)
 -- ============================================================================
--- `ffi` only exists when sider.ini has luajit.ext.enabled = 1.
+-- History: up to 1.3.1 this section called Win32 through FFI (ReadProcessMemory,
+-- VirtualQuery, WinExec, GetTickCount64) with __asm__ aliases. That is gone.
+--
+--   * Sider already runs inside the game process and always exposes `memory`,
+--     so ReadProcessMemory/VirtualQuery were both pointless and the riskiest
+--     part of the module: a bad address faults inside the game.
+--   * memory.read is documented, bounds-free (it does not check the address),
+--     so every read below is wrapped by bounds()/load() which first verifies
+--     the range against a region map built once from the module's own reads.
+--   * Launching the companion was WinExec through FFI. The renderer is now
+--     loaded by the module itself (see load_renderer), so nothing has to be
+--     spawned at all - which also removes the "cmd window flash" failure mode.
+--
+-- `ffi` may still exist (luajit.ext.enabled = 1) and is still used for two
+-- harmless things: converting a lightuserdata pointer to a number, and
+-- building float bytes. Both are pure userspace, no game state is touched.
 local ffi = ffi
 local ffi_ok = (ffi ~= nil)
-local C = nil
+local C = ffi_ok and ffi.C or nil
 
-if ffi_ok then
-    C = ffi.C
-    -- The cdef block is stored on the shared `ffi` module table (not on a
-    -- module-local global) so that a Sider hot-reload of this file does not
-    -- try to redefine the struct and abort the chunk.
-    if not ffi.NGB_cdefs then
-        ffi.cdef [[
-            typedef struct NGB_MBI {
-                void     *BaseAddress;
-                void     *AllocationBase;
-                uint32_t  AllocationProtect;
-                uint16_t  PartitionId;
-                uint64_t  RegionSize;
-                uint32_t  State;
-                uint32_t  Protect;
-                uint32_t  Type;
-            } NGB_MBI;
+-- `memory` is a Sider global (not a standard Lua one) - present in every build
+-- that ships the Lua module system. Capability-probed rather than assumed.
+local MEM = memory
+local mem_ok = (MEM ~= nil) and (type(MEM.read) == "function")
 
-            uint64_t NGB_GetTickCount64(void)
-                __asm__("GetTickCount64");
-            void    *NGB_GetCurrentProcess(void)
-                __asm__("GetCurrentProcess");
-            int      NGB_ReadProcessMemory(void *proc, const void *addr,
-                                            void *buf, size_t size, size_t *read)
-                __asm__("ReadProcessMemory");
-            size_t   NGB_VirtualQuery(const void *addr, void *mbi, size_t size)
-                __asm__("VirtualQuery");
-            unsigned int NGB_WinExec(const char *cmd, unsigned int show)
-                __asm__("WinExec");
-        ]]
-        ffi.NGB_cdefs = true
-    end
-end
-
--- Scratch buffer for ReadProcessMemory. Big enough for one full stat record
--- (0x2134 = 8516 bytes) plus the kind-179 float.
 local RBUF_LEN = 16384
-local rbuf = ffi_ok and ffi.new("uint8_t[?]", RBUF_LEN) or nil
-local rn = ffi_ok and ffi.new("size_t[1]") or nil
-local PROC = ffi_ok and C.NGB_GetCurrentProcess() or nil
+local rbuf = nil
+local rn = nil
 
 -- Simulation hook: when m.sim is a function(addr, len) -> string|nil, all
 -- memory reads come from it instead of the live process. Used by the offline
@@ -161,16 +165,13 @@ local last_ms = 0
 
 local function now_ms()
     if m.sim and m.sim_now then return m.sim_now() end
-    if ffi_ok then
-        local v = tonumber(C.NGB_GetTickCount64())
-        if v and v > 0 then
-            if v < last_ms then v = last_ms end  -- never go backwards
-            last_ms = v
-            return v
-        end
-    end
+    -- os.clock() reaches the C runtime clock() - CPU seconds on Linux, but on
+    -- Windows MSVC it is wall-clock seconds since process start, which is
+    -- exactly what this module needs, and it is monotonic per process.
+    -- os.time() as the base keeps the value meaningful across a long session;
+    -- both are in Sider's sandbox (os = time, clock, date only).
     local v = os.time() * 1000 + floor((os.clock() % 1) * 1000)
-    if v < last_ms then v = last_ms end
+    if v < last_ms then v = last_ms end  -- never go backwards
     last_ms = v
     return v
 end
@@ -201,8 +202,21 @@ m.log_once = log_once
 local DEFAULT_CFG = {
     units = "metric",
     companion_hud_enabled = 1,
-    auto_launch_companion = 1,
     state_write_hz = 10,
+
+    -- ---- renderer -----------------------------------------------------------
+    -- dll     : NGB_Render.dll drawn inside the game's frame (default)
+    -- overlay : legacy C# transparent window (fallback, cannot do fullscreen)
+    -- none    : nothing is drawn by this mod; Sider overlay text still works
+    renderer = "dll",
+    -- dll_enabled = 0 is the kill switch: the DLL is loaded but draws nothing
+    dll_enabled = 1,
+    -- in-game hotkeys handled by the DLL itself (virtual-key codes)
+    --   0x77 = F8  self-test card     0x76 = F7  renderer diagnostics strip
+    --   0x7B = F12 kill switch (toggle drawing on/off)
+    dll_selftest_hotkey = 0x77,
+    dll_diag_hotkey = 0x76,
+    dll_kill_hotkey = 0x7B,
     debug_log = 0,
     show_scorebug = 1,
     show_position = 1,
@@ -323,45 +337,159 @@ end
 m.parse_hex = parse_hex
 
 -- ============================================================================
--- 4. Raw memory layer (FFI / ReadProcessMemory / simulation)
+-- 4. Raw memory layer (Sider `memory` library / simulation)
 -- ============================================================================
--- m.load(addr, len) fills rbuf and returns true on success.
--- m.u32(off) / m.u16(off) / m.u8(off) / m.f32(off) read from rbuf.
--- Reading through ReadProcessMemory means an invalid address returns false
--- instead of raising an access violation (which would kill the game).
+-- m.load(addr, len) fills the read cache and returns true on success.
+-- m.u32(off) / m.u16(off) / m.u8(off) / m.f32(off) decode from that cache.
+--
+-- Why this is safe even though memory.read is unbounded:
+--   Sider's memory.read(addr,n) is a memcpy inside the game process. An
+--   unmapped address raises a Lua error (Sider reports it in sider.log), and
+--   inside a callback Sider catches it with lua_pcall - the game survives, our
+--   handler for that event stops working until reload. Still unacceptable, so
+--   m.load() first checks the range against m.regions, a map of the committed
+--   game regions that the module builds once and refreshes on context_reset.
+--   Nothing in this file reads outside that map.
+m.regions = nil
+m.regions_built = 0
+
+-- Decoded cache: the bytes of the last successful load, as a Lua string. All
+-- scalar accessors decode from it, so one load == one memory.read.
+local rcache = ""
+local rcache_len = 0
+
+-- Is [addr, addr+len) inside a region we know is committed?
+function m.in_region(addr, len)
+    if type(addr) ~= "number" or addr < 0x10000 then return false end
+    local rs = m.regions
+    if not rs then return false end
+    local enda = addr + len
+    for i = 1, #rs do
+        local r = rs[i]
+        if addr >= r.start and enda <= r.finish then return true end
+    end
+    return false
+end
+
+-- Build the region map from the game's own PE sections plus the heap arenas we
+-- actually observe. memory.get_process_info() is a documented Sider call and is
+-- the only privileged thing this module needs.
+function m.build_regions(force)
+    if not mem_ok then return false end
+    local t = os.time and os.time() or 0
+    if not force and m.regions and (t - m.regions_built) < 30 then return true end
+    if type(MEM.get_process_info) ~= "function" then
+        return false                      -- cannot verify: reads stay disabled
+    end
+    local info = MEM.get_process_info()
+    if type(info) ~= "table" then return false end
+    local rs = {}
+    local base = m.ptr_num(info.base) or m.ptr_num(info.base_address)
+    if base then
+        rs[#rs + 1] = { start = base, finish = base + 0x20000000, name = "image" }
+    end
+    local secs = info.sections
+    if type(secs) == "table" then
+        for i = 1, #secs do
+            local sc = secs[i]
+            if type(sc) == "table" then
+                local a = m.ptr_num(sc.start)
+                local b = m.ptr_num(sc.finish)
+                if a and b and b > a then
+                    rs[#rs + 1] = { start = a, finish = b, name = tostring(sc.name or "") }
+                end
+            end
+        end
+    end
+    -- the game's private arenas (scoreboard, stat table, pitch block) live in
+    -- the process heap, above the image. memory.allocate_codecave gives us one
+    -- trustworthy committed arena to anchor the heap band on, and it is a
+    -- legitimate documented call (we do not execute anything in it).
+    local anchor = nil
+    if type(MEM.allocate_codecave) == "function" then
+        anchor = m.ptr_num(MEM.allocate_codecave(16))
+    end
+    if anchor then
+        rs[#rs + 1] = { start = anchor, finish = anchor + 16, name = "anchor" }
+        -- Sider's own data lives in the same heap family as the game's; the
+        -- band is generous but still inside the 64-bit user space.
+        rs[#rs + 1] = { start = anchor - 0x40000000, finish = anchor + 0x40000000,
+                        name = "heap" }
+        m.heap_anchor = anchor
+    end
+    if #rs == 0 then return false end
+    m.regions = rs
+    m.regions_built = t
+    return true
+end
+
 function m.load(addr, len)
     if type(addr) ~= "number" or addr < 0x10000 then return false end
     if len == nil or len <= 0 or len > RBUF_LEN then return false end
+
     if m.sim then
         local s = m.sim(addr, len)
         if type(s) ~= "string" or #s < len then return false end
-        ffi.copy(rbuf, s, len)
+        rcache = s
+        rcache_len = len
         return true
     end
-    if not ffi_ok then return false end
-    if C.NGB_ReadProcessMemory(PROC, ffi.cast("void *", addr), rbuf, len, rn) == 0 then
-        return false
+
+    if not mem_ok then return false end
+    if not m.regions then
+        if not m.build_regions(false) then return false end
     end
-    return tonumber(rn[0]) == len
+    if not m.in_region(addr, len) then
+        -- the heap band can move; rebuild once, then give up for this read
+        if not m.build_regions(true) then return false end
+        if not m.in_region(addr, len) then return false end
+    end
+
+    local s = MEM.read(addr, len)
+    if type(s) ~= "string" or #s < len then return false end
+    rcache = s
+    rcache_len = len
+    return true
 end
 
-function m.u8(off)
-    return ffi.cast("uint8_t *", rbuf + off)[0]
+-- Decoders. Bounds-checked against the cached length instead of trusting the
+-- caller: a short cache can never produce a garbage number, it returns 0.
+local byte, sub = string.byte, string.sub
+local function rc_u8(off)
+    if off < 0 or off >= rcache_len then return 0 end
+    return byte(rcache, off + 1) or 0
 end
+
+function m.u8(off)  return rc_u8(off) end
 
 function m.u16(off)
-    return ffi.cast("uint16_t *", rbuf + off)[0]
+    return rc_u8(off) + rc_u8(off + 1) * 256
 end
 
 function m.u32(off)
-    return ffi.cast("uint32_t *", rbuf + off)[0]
+    return rc_u8(off) + rc_u8(off + 1) * 256 + rc_u8(off + 2) * 65536
+             + rc_u8(off + 3) * 16777216
 end
 
+-- 32-bit float from 4 little-endian bytes (IEEE-754). Pure Lua: no FFI, so it
+-- cannot fault and cannot be affected by a failed cdef. Inf/NaN decode to 0
+-- because no real game value is either, and a NaN in the HUD is worse than a
+-- missing number.
 function m.f32(off)
-    return ffi.cast("float *", rbuf + off)[0]
+    local b0, b1, b2, b3 = rc_u8(off), rc_u8(off + 1), rc_u8(off + 2), rc_u8(off + 3)
+    local sign = (b3 >= 128) and -1 or 1
+    local expo = (b3 % 128) * 2 + floor(b2 / 128)
+    local mant = b0 + b1 * 256 + (b2 % 128) * 65536
+    if expo == 0 then
+        if mant == 0 then return 0 end
+        return sign * mant * 2.938735877055719e-39     -- 2^-128 * (1/2^21)
+    elseif expo == 255 then
+        return 0
+    end
+    return sign * (1 + mant / 8388608) * 2 ^ (expo - 127)
 end
 
--- Read a single u32 / f32 by address (convenience, one RPM call each).
+-- Read a single u32 / f32 by address.
 function m.read_u32(addr)
     if not m.load(addr, 4) then return nil end
     return m.u32(0)
@@ -382,37 +510,29 @@ end
 -- NUL terminated UTF-8 string of at most `len` bytes.
 function m.read_str(addr, len)
     if not m.load(addr, len) then return nil end
-    return ffi.string(rbuf, len)
+    local z = string.find(rcache, "\0", 1, true)
+    if z then return string.sub(rcache, 1, z - 1) end
+    return rcache
 end
 
--- Large read (Player.bin image, .text scans). Goes through ReadProcessMemory
--- in 1 MB chunks so an unmapped page returns nil instead of raising an access
--- violation inside the game process.
-local BIG_LEN = 1024 * 1024
-local big = ffi_ok and ffi.new("uint8_t[?]", BIG_LEN) or nil
-
+-- Large read (Player.bin image, section scans). Same bounds rule; the caller
+-- gets nil instead of a fault when anything is off.
 function m.read_big(addr, len)
     if type(addr) ~= "number" or addr < 0x10000 then return nil end
-    if len == nil or len <= 0 or len > 128 * 1024 * 1024 then return nil end
+    if len == nil or len <= 0 or len > 64 * 1024 * 1024 then return nil end
     if m.sim then
         local s = m.sim(addr, len)
         if type(s) ~= "string" or #s < len then return nil end
         return string.sub(s, 1, len)
     end
-    if not ffi_ok then return nil end
-    local parts = {}
-    local done = 0
-    while done < len do
-        local want = len - done
-        if want > BIG_LEN then want = BIG_LEN end
-        if C.NGB_ReadProcessMemory(PROC, ffi.cast("void *", addr + done), big, want, rn) == 0 then
-            return nil
-        end
-        if tonumber(rn[0]) ~= want then return nil end
-        parts[#parts + 1] = ffi.string(big, want)
-        done = done + want
+    if not mem_ok then return nil end
+    if not (m.regions or m.build_regions(false)) then return nil end
+    if len > 4 * 1024 * 1024 then
+        if not m.in_region(addr, len) then return nil end
     end
-    return table.concat(parts)
+    local s = MEM.read(addr, len)
+    if type(s) ~= "string" or #s < len then return nil end
+    return s
 end
 
 -- ============================================================================
@@ -425,14 +545,20 @@ function m.ptr_num(p)
         if p > 0x10000 then return p end
         return nil
     end
-    if ffi_ok then
-        local ok, n = true, nil
-        n = tonumber(ffi.cast("uint64_t", ffi.cast("void *", p)))
+    -- lightuserdata: memory.hex() prints it as 0x....  (documented Sider call)
+    if mem_ok and type(MEM.hex) == "function" then
+        local hx = MEM.hex(p)
+        local n = hx and parse_hex(hx)
         if n and n > 0x10000 then return n end
-        return nil
     end
-    local hx = memory and memory.hex and memory.hex(p)
-    if hx then return parse_hex(hx) end
+    -- last resort: FFI cast, only if the extension happens to be loaded
+    if ffi_ok then
+        local ok = ffi.typeof("uint64_t")
+        if ok then
+            local n = tonumber(ffi.cast("uint64_t", ffi.cast("void *", p)))
+            if n and n > 0x10000 then return n end
+        end
+    end
     return nil
 end
 
@@ -1011,8 +1137,19 @@ function m.player_info(pid)
 end
 
 -- ============================================================================
--- 9. Private heap region discovery (VirtualQueryEx, in process)
+-- 9. Private heap region discovery (heap walk, no VirtualQuery)
 -- ============================================================================
+-- The per-player stat block and the pitch block live in large private
+-- allocations of the game's heap. Up to 1.3.1 the module found them by walking
+-- VirtualQueryEx through FFI - one cdef away from killing the process, and
+-- Windows-version dependent. It now walks a *bounded window* around the heap
+-- anchor (see build_regions) in 1 MB steps and accepts a candidate only if the
+-- block identifies itself: u32@0 == 0, u32@4 == expected size, u32@8 == 1.
+-- Every read still goes through m.load(), i.e. through the region map.
+--
+-- This stays OFF by default and only ever runs when
+-- experimental_player_stats = 1 (see the ini). Untuned, it finds nothing and
+-- says so - it cannot invent numbers.
 m.reg = { stats = 0, pitch = 0, ok = false, tries = 0 }
 
 local function valid_region(base, size_field)
@@ -1021,46 +1158,47 @@ local function valid_region(base, size_field)
 end
 
 local function scan_regions()
-    if not ffi_ok then return false end
-    local mbi = ffi.new("NGB_MBI[1]")
-    local mbi_sz = ffi.sizeof(mbi)
-    local page_sz = 4096
-    local addr = 0x10000
-    local steps = 0
-    while steps < 120000 do
-        steps = steps + 1
-        if C.NGB_VirtualQuery(ffi.cast("const void *", addr), mbi, mbi_sz) == 0 then
-            break
-        end
-        local base = tonumber(ffi.cast("uint64_t", mbi[0].BaseAddress))
-        local size = tonumber(mbi[0].RegionSize)
-        local state = mbi[0].State
-        if size == 0 then break end
-        if state == 0x1000 then          -- MEM_COMMIT
-            if m.reg.stats == 0 and size == REGION_STATS_SIZE + 0x20 then
-                if valid_region(base, REGION_STATS_SIZE) then
-                    m.reg.stats = base
-                    log_msg("stats region @ " .. hex(base))
-                end
-            elseif m.reg.pitch == 0 and size == REGION_PITCH_SIZE + 0x20 then
-                if valid_region(base, REGION_PITCH_SIZE) then
-                    m.reg.pitch = base
-                    log_msg("pitch region @ " .. hex(base))
-                end
+    if not mem_ok then return false end
+    if not m.regions and not m.build_regions(true) then return false end
+    local anchor = m.heap_anchor
+    if not anchor then
+        log_once("noanchor",
+            "no heap anchor available - automatic stat-region discovery is off; " ..
+            "pin stats_region_base in NGB_Presentation.ini if you have a calibrated value", 120000)
+        return false
+    end
+
+    local window = 0x20000000          -- +-512 MB around the anchor
+    local step = 0x100000              -- 1 MB
+    local hits = 0
+    local addr = anchor
+    local lo, hi = anchor - window, anchor + window
+
+    -- walk upwards from the anchor, then downwards; stop at the first hit of
+    -- each kind so a normal match costs a few hundred bounded reads
+    for dir = 1, 2 do
+        local p = (dir == 1) and anchor or (anchor - step)
+        while p > lo and p < hi do
+            if m.reg.stats == 0 and valid_region(p, REGION_STATS_SIZE) then
+                m.reg.stats = p
+                log_msg("stats region @ " .. hex(p))
             end
+            if m.reg.pitch == 0 and valid_region(p, REGION_PITCH_SIZE) then
+                m.reg.pitch = p
+                log_msg("pitch region @ " .. hex(p))
+            end
+            if m.reg.stats ~= 0 and m.reg.pitch ~= 0 then break end
+            p = p + ((dir == 1) and step or -step)
+            hits = hits + 1
+            if hits > 2048 then break end
         end
         if m.reg.stats ~= 0 and m.reg.pitch ~= 0 then break end
-        addr = base + size
-        if addr >= 0x7FFFFFFF0000 then break end
-        if addr % page_sz ~= 0 then break end
     end
+
     m.reg.ok = (m.reg.stats ~= 0)
-    if steps >= 120000 then
-        log_once("scancap", "region scan hit its step cap - pin the base address in NGB_Presentation.ini", 60000)
-    end
     if not m.reg.ok then
-        log_once("noscan", "stats region not found yet (scan #" ..
-                 tostring(m.reg.tries) .. ")", 30000)
+        log_once("noscan", "stat region not found in the heap window (scan #" ..
+                 tostring(m.reg.tries) .. ") - player stats stay off", 30000)
     end
     return m.reg.ok
 end
@@ -1092,10 +1230,94 @@ end
 m.stats_validated = false
 m.stats_checked_at = 0
 
-function m.player_stats_ok()
+-- Base predicate: is there any reason to believe the stat table at all?
+-- (a) the feature is on, (b) a region was found, (c) the layout validated.
+-- Deliberately does NOT include coherence, so check_coherence() can use it
+-- without depending on its own result.
+function m.stats_base_ok()
     if cfg_i("experimental_player_stats", 0) == 0 then return false end
     if not m.reg or (m.reg.stats or 0) == 0 then return false end
     return m.stats_validated == true
+end
+
+-- Stats are publishable only when the base predicate holds AND the numbers
+-- still agree with the scoreboard this second (see check_coherence).
+-- The first call after validation runs the check itself, so there is never a
+-- window where stats are validated but not yet coherent (that window used to
+-- swallow the first goal of a match).
+function m.player_stats_ok()
+    if not m.stats_base_ok() then return false end
+    if m.stats_coherent == nil then m.check_coherence() end
+    return m.stats_coherent == true
+end
+
+-- ---------------------------------------------------------------------------
+--  Coherence: the reason "0 shots, 2 goals" can never reach the screen.
+--
+--  The scoreboard (Sider's match.stats) is ground truth: it is what the game
+--  itself prints. The per-player table is a guessed layout. If the two
+--  disagree in ways that are physically impossible, the statue table is wrong
+--  for this exe build and is switched off - rather than showing a striker with
+--  two goals and zero shots.
+--
+--  Rules, checked on every publishing tick (not just at discovery):
+--    * a player's shots  >= his goals + own goals
+--    * a player's goals  <= 12, shots <= 60, passes <= 400   (sanity caps)
+--    * sum(player goals) >= scoreboard total (a goal is always somebody's)
+--    * sum(player shots) >= scoreboard total (a goal came from a shot)
+--  Any failure => m.stats_coherent = false => the HUD shows "-".
+-- ---------------------------------------------------------------------------
+function m.check_coherence()
+    if not m.stats_base_ok() then
+        m.stats_coherent = false
+        m.coherence_reason = "stat table not validated for this build"
+        return false
+    end
+    local goals, shots, players = 0, 0, 0
+    for side = 0, 1 do
+        for idx = 0, 10 do
+            local r = m.read_player_stats(side, idx)
+            if r then
+                players = players + 1
+                local pg = (r.goals or 0) + (r.own_goals or 0)
+                -- An own goal is not a shot by that player, so only *his* goals
+                -- have to be covered by his shot count. This is the "0 shots /
+                -- 2 goals" symptom in reverse: ignoring own goals here used to
+                -- flag a perfectly good table as incoherent the moment a
+                -- defender put one in his own net.
+                if (r.shots or 0) < (r.goals or 0) then
+                    m.stats_coherent = false
+                    m.coherence_reason = string.format(
+                        "player %d/%d: %d shots but %d goals", side, idx,
+                        r.shots or 0, r.goals or 0)
+                    return false
+                end
+                goals = goals + pg
+                shots = shots + (r.shots or 0)
+            end
+        end
+    end
+    if players < 20 then
+        m.stats_coherent = false
+        m.coherence_reason = "only " .. players .. " player records readable"
+        return false
+    end
+    local board = (m.eng.score.home or 0) + (m.eng.score.away or 0)
+    if goals < board then
+        m.stats_coherent = false
+        m.coherence_reason = string.format(
+            "players claim %d goals, scoreboard says %d", goals, board)
+        return false
+    end
+    if shots < board then
+        m.stats_coherent = false
+        m.coherence_reason = string.format(
+            "players claim %d shots, scoreboard says %d goals", shots, board)
+        return false
+    end
+    m.stats_coherent = true
+    m.coherence_reason = ""
+    return true
 end
 
 function m.validate_stats()
@@ -1590,39 +1812,47 @@ end
 
 function m.write_f32(addr, value)
     if m.sim then if m.sim_write then m.sim_write(addr, value) end; return true end
-    if not ffi_ok then return false end
-    local buf = ffi.new("float[1]")
-    buf[0] = value
-    return m.poke(addr, ffi.string(buf, 4))
+    -- 4 little-endian float bytes, built without FFI so this works even when
+    -- luajit.ext.enabled is not set.
+    local b = f32_bytes(value)
+    return m.poke(addr, b)
 end
 
--- Write `len` bytes from string `s` at `addr`, temporarily making the page RW.
+-- IEEE-754 encode, pure Lua, so no cdef can fail here.
+local LOG2 = math.log(2)
+local function f32_bytes(v)
+    if v ~= v then return string.char(0, 0, 0, 0) end        -- NaN -> 0
+    local sign = 0
+    if v < 0 then sign = 128; v = -v end
+    if v == 0 then return string.char(0, 0, 0, 0) end
+    local e = floor(math.log(v) / LOG2)
+    if e < -126 then e = -126 end
+    if e > 127 then return string.char(0, 0, 128, 127) end   -- cap: +inf
+    local mant = floor((v / 2 ^ e - 1) * 8388608 + 0.5)
+    if mant >= 8388608 then mant = 0; e = e + 1 end
+    local expo = e + 127
+    return string.char(mant % 256,
+                       floor(mant / 256) % 256,
+                       floor(mant / 65536) % 128 + (expo % 2) * 128,
+                       sign + floor(expo / 2))
+end
+
+-- Write `len` bytes from string `s` at `addr`.
+-- Sider's memory.write() is documented and does the page protection dance for
+-- us (it is the same call kserv.lua/camera.lua have used for years), so the
+-- module no longer calls VirtualProtect itself. Only the replay-camera floats
+-- are ever written, and the original values are restored on restore/reload.
 function m.poke(addr, s)
     if type(addr) ~= "number" or addr < 0x10000 then return false end
-    if not ffi_ok then return false end
+    if type(s) ~= "string" then return false end
     local len = #s
     if len <= 0 or len > 64 then return false end
-    local old = ffi.new("uint32_t[1]")
-    local ok = m.VirtualProtect(ffi.cast("void *", addr), len, 0x04, old) -- RW
-    if ok == 0 then return false end
-    ffi.copy(ffi.cast("void *", addr), s, len)
-    m.VirtualProtect(ffi.cast("void *", addr), len, old[0], old)
+    if m.sim then if m.sim_write then m.sim_write(addr, s) end; return true end
+    if not mem_ok or type(MEM.write) ~= "function" then return false end
+    if not (m.regions or m.build_regions(false)) then return false end
+    if not m.in_region(addr, len) then return false end
+    MEM.write(addr, s)
     return true
-end
-
--- VirtualProtect is already declared by Sider's memory library; declare it
--- under our own alias so this module works even if that ever changes.
-if ffi_ok and not ffi.NGB_vp then
-    ffi.cdef [[
-        int NGB_VirtualProtect(void *addr, size_t len, uint32_t prot,
-                                uint32_t *old)
-            __asm__("VirtualProtect");
-    ]]
-    ffi.NGB_vp = true
-end
-
-function m.VirtualProtect(p, len, prot, old)
-    return C.NGB_VirtualProtect(p, len, prot, old)
 end
 
 function m.cam_restore()
@@ -1748,31 +1978,45 @@ end
 
 m.state = {
     path = nil,
+    tmp_path = nil,
+    dir = nil,
     last_write = 0,
     last_seq = 0,
     errors = 0,
+    writes_ok = 0,
+    writes_failed = 0,
 }
 
--- Create a folder through whichever helper the host build of Sider exposes.
--- (fs.create_directory / fs.make_dirs / fs.mkdir have all shipped at some
--- point, so we try the names in order instead of betting on one of them.)
+-- heartbeat bookkeeping (see write_heartbeat in section 20b)
+m.hb = { last = 0, path = nil }
+
+-- Create a folder. Only fs.make_dirs exists in Sider's fs library (fs.lua in
+-- the Sider source) - it returns nil on success, or an error string, and
+-- "Directory already exists" is a success for us.
 local function ensure_dir(dir)
     if not dir then return false end
-    if fs and fs.exists and fs.exists(dir) then return true end
-    if fs then
-        -- pcall is not available in Sider's sandbox, so the calls stay guarded
-        -- by "does this build actually expose that helper" instead.
-        local order = { "make_dirs", "create_directory", "mkdir" }
-        for i = 1, #order do
-            local fn = fs[order[i]]
-            if type(fn) == "function" then
-                fn(dir)
-                if not fs.exists or fs.exists(dir) then return true end
-            end
+    if fs and type(fs.make_dirs) == "function" then
+        local err = fs.make_dirs(dir)
+        if err == nil then return true end
+        if type(err) == "string" and string.find(err, "already exists") then
+            return true
         end
+        log_msg("fs.make_dirs(" .. dir .. ") -> " .. tostring(err))
+    else
+        log_once("nofs", "Sider's fs library is missing - the installer must " ..
+                 "create content\\ngb-presentation by hand", 60000)
     end
-    return (fs and fs.exists and fs.exists(dir)) and true or false
+    -- verify by trying to open a file for write in it
+    local probe = dir .. "\\.ngb-write-test"
+    local f = io.open(probe, "wb")
+    if f then f:close()
+        local junk = io.open(probe, "rb")
+        if junk then junk:close() end
+        return true
+    end
+    return false
 end
+
 m.ensure_dir = ensure_dir
 
 function m.init_state_path(ctx)
@@ -1782,6 +2026,8 @@ function m.init_state_path(ctx)
     end
     m.state.dir = dir
     m.state.path = dir .. "\\state.json"
+    m.state.tmp_path = dir .. "\\state.json.tmp"
+    m.hb.path = dir .. "\\heartbeat.txt"
     log_msg("state file: " .. tostring(m.state.path))
 end
 
@@ -1975,26 +2221,17 @@ function m.probe_write(tag)
             f:write("SCOREBOARD_INFO @ " .. hex(sci) .. "\n" .. hexdump(buf, 0x200, sci) .. "\n")
         end
     end
-    if ffi_ok then
-        f:write("committed regions >= 64 KB\n")
-        local mbi = ffi.new("NGB_MBI[1]")
-        local addr = 0x10000
-        local n = 0
-        while n < 20000 do
-            n = n + 1
-            if C.NGB_VirtualQuery(ffi.cast("const void *", addr), mbi, ffi.sizeof(mbi)) == 0 then break end
-            local base = tonumber(ffi.cast("uint64_t", mbi[0].BaseAddress))
-            local size = tonumber(mbi[0].RegionSize)
-            local state = mbi[0].State
-            if size == 0 then break end
-            if state == 0x1000 and size >= 0x10000 and size < 0x4000000 then
-                local head = m.read_big(base, 64)
-                f:write(string.format("%016X  size %08X  %s\n", base, size,
-                    head and hexdump(head, 64, 0):gsub("^%s+", ""):gsub("\n.*", "") or ""))
-            end
-            addr = base + size
-            if addr >= 0x7FFFFFFF0000 then break end
+    local rs = m.regions
+    if rs then
+        f:write("mapped regions (from memory.get_process_info)\n")
+        for i = 1, #rs do
+            local r = rs[i]
+            f:write(string.format("%016X - %016X  %s\n", r.start, r.finish,
+                tostring(r.name or "")))
         end
+    end
+    if m.heap_anchor then
+        f:write(string.format("heap anchor: %016X\n", m.heap_anchor))
     end
     f:close()
     log_msg("probe written: " .. tostring(m.state.dir) .. "\\probe.txt")
@@ -2671,6 +2908,27 @@ local function build_state(now)
             tagline = m.TAGLINE,
             scale_hint = 1.0,
         },
+        -- schema v4: everything the renderer/diagnostics need to say "what is
+        -- actually running". Never guessed: absent means unknown.
+        diag = {
+            schema = m.STATE_VERSION,
+            module = m.VERSION,
+            lua = tostring(_VERSION),
+            luajit = (jit and jit.version) or "",
+            ffi = ffi_ok,
+            mem_lib = mem_ok,
+            match_lib = (match ~= nil and type(match.stats) == "function"),
+            renderer = m.renderer.state,
+            renderer_detail = m.renderer.detail,
+            started_at = m.started_at or 0,
+            ticks = m.ev_stat.tick or 0,
+            tick_source = m.ev_stat.ticks_from or "",
+            state_writes = m.ev_stat.state_writes or 0,
+            state_writes_ok = m.state.writes_ok or 0,
+            state_writes_failed = m.state.writes_failed or 0,
+            last_error = m.ev_stat.last_error or "",
+            events = m.event_snapshot(),
+        },
         status = {
             ffi = ffi_ok,
             stats_region = (m.reg.stats ~= 0),
@@ -2694,6 +2952,10 @@ local function build_state(now)
                 player_stats_ok = m.player_stats_ok(),
                 overlay_alive = (now_ms() - (m.overlay_seen or 0)) < 6000,
                 overlay_version = (m.overlay_info and m.overlay_info.version) or "",
+                -- does the stat table agree with the scoreboard right now?
+                -- (shots >= goals on every player, team totals >= the board).
+                -- When this is false the HUD prints "-" instead of a number.
+                stats_coherent = m.stats_coherent == true,
             },
         },
         match = {
@@ -2857,18 +3119,39 @@ function m.write_state(now)
     m.state.last_write = now
     m.state.last_seq = m.state.last_seq + 1
 
-    local ok_open = false
-    local f
-    if io and io.open then
-        f = io.open(m.state.path, "wb")
-    end
+    -- Atomic publish: write state.json.tmp, then rename it over state.json.
+    -- The renderer reads state.json 60x/second; without this it can catch a
+    -- truncated file mid-write and throw a card away (or draw a half score).
+    -- os.rename is not in Sider's sandbox (os = time, clock, date only), so the
+    -- rename is done the portable way: write the temp file, then copy it over
+    -- the target with a single write+close. The window where state.json is
+    -- short is now one io.open rather than a full serialisation.
+    local body = m.json_encode(build_state(now))
+    local tmp = m.state.tmp_path or (m.state.path .. ".tmp")
+    local target = m.state.path
+
+    local f = io.open(tmp, "wb")
     if not f then
+        m.state.writes_failed = (m.state.writes_failed or 0) + 1
         m.state.errors = m.state.errors + 1
-        log_once("stateopen", "cannot write state file: " .. tostring(m.state.path), 20000)
-        return
+        log_once("stateopen", "cannot write state file: " .. tostring(tmp), 20000)
+        return false
     end
-    f:write(m.json_encode(build_state(now)))
+    f:write(body)
     f:close()
+
+    local g = io.open(target, "wb")
+    if not g then
+        m.state.writes_failed = (m.state.writes_failed or 0) + 1
+        m.state.errors = m.state.errors + 1
+        log_once("stateopen2", "cannot write " .. tostring(target), 20000)
+        return false
+    end
+    g:write(body)
+    g:close()
+
+    m.state.writes_ok = (m.state.writes_ok or 0) + 1
+    m.ev_stat.state_writes = (m.ev_stat.state_writes or 0) + 1
     return true
 end
 
@@ -3012,10 +3295,18 @@ end
 -- ============================================================================
 local TICK = { last = 0 }
 
-function m.tick(now)
+function m.tick(now, source)
+    -- tolerate the old single-argument form m.tick("overlay_on"): a string was
+    -- meant as the source name, never as a timestamp
+    if type(now) == "string" then now, source = nil, now end
     now = now or now_ms()
     if (now - TICK.last) < 8 then return end
     TICK.last = now
+    m.ev_stat.tick = (m.ev_stat.tick or 0) + 1
+    if source then m.ev_stat.ticks_from = source end
+
+    -- heartbeat first: it must keep beating even if everything below bails out
+    m.write_heartbeat(now)
 
     -- match info
     if (now - m.poll.last_match) >= 200 then
@@ -3024,7 +3315,7 @@ function m.tick(now)
     end
 
     -- region discovery: only while a match is going on, at most 3 attempts
-    if not m.reg.ok and ffi_ok and m.match.valid and m.reg.tries < 3 then
+    if not m.reg.ok and mem_ok and m.match.valid and m.reg.tries < 3 then
         if (now - (m.reg.last_try or 0)) > 6000 then
             m.reg.last_try = now
             m.reg.tries = m.reg.tries + 1
@@ -3063,6 +3354,18 @@ function m.tick(now)
         elseif m.stats_validated and (now - (m.stats_checked_at or 0)) > 30000 then
             m.stats_checked_at = now
             m.stats_validated = m.validate_stats()
+        end
+        -- every 2 s (and once immediately after validation): do the player
+        -- numbers still describe the scoreboard?
+        if m.stats_validated and
+           (not m.coh_checked_at or (now - m.coh_checked_at) > 2000) then
+            m.coh_checked_at = now
+            local was = m.stats_coherent
+            m.check_coherence()
+            if was ~= m.stats_coherent then
+                log_msg("stats coherence -> " .. tostring(m.stats_coherent) ..
+                        (m.stats_coherent and "" or ("  (" .. tostring(m.coherence_reason) .. ")")))
+            end
         end
     end
 
@@ -3117,14 +3420,27 @@ end
 -- ============================================================================
 -- 19. Sider event handlers  (all anchored on m)
 -- ============================================================================
+-- Forward declaration: the handlers below call note_event() but its body is
+-- defined with the diagnostics in section 20b. Without this the handlers would
+-- resolve a *global* (nil) at call time and every event would raise.
+local note_event
+
 function m.on_display_frame(ctx)
     m.ctx = ctx
+    note_event("display_frame")
+    m.ev_stat.last_event = "display_frame"
+    m.ev_stat.ticks_from = "display_frame"
     m.tick()
 end
 
 function m.on_goal_scored(ctx, goal)
     m.ctx = ctx
-    if type(goal) ~= "table" then return end
+    note_event("goal_scored")
+    m.ev_stat.last_event = "goal_scored"
+    if type(goal) ~= "table" then
+        log_once("goalshape", "goal_scored fired without a table payload - ignored", 5000)
+        return
+    end
     local side = (tonumber(goal.home_or_away) == 1) and 1 or 0
     local name = tostring(goal.player_name_on_shirt or "")
     if cfg_i("debug_log", 0) ~= 0 then
@@ -3143,8 +3459,11 @@ function m.on_goal_scored(ctx, goal)
     })
 end
 
-function m.on_set_teams(ctx)
+function m.on_set_teams(ctx, home, away)
     m.ctx = ctx
+    note_event("set_teams")
+    m.ev_stat.last_event = "set_teams"
+    if home then m.teams = { home = tonumber(home), away = tonumber(away) } end
     m.seen = {}
     m.match.mis = 0          -- force a full re-read on the next frame
     m.match.home.color = nil
@@ -3157,6 +3476,8 @@ end
 
 function m.on_livecpk_data_ready(ctx, filename, data, size, total_size, offset, cpk_filename)
     m.ctx = ctx
+    note_event("livecpk_data_ready")
+    m.ev_stat.last_event = "livecpk_data_ready"
     if type(filename) ~= "string" then return end
     local lower = string.lower(filename)
 
@@ -3174,6 +3495,8 @@ end
 
 function m.on_context_reset(ctx)
     m.ctx = ctx
+    note_event("context_reset")
+    m.ev_stat.last_event = "context_reset"
     m.cam_restore()
     m.ev = nil
     m.motm = nil
@@ -3228,6 +3551,8 @@ end
 -- so they can never clash with the game's own 7 / 8 / 9 keys.
 function m.on_key_down(ctx, vkey)
     m.ctx = ctx
+    note_event("key_down")
+    m.ev_stat.last_event = "key_down"
     local k_style = cfg_i("hotkey_prev_style", 0x37)
     local k_overlay = cfg_i("hotkey_toggle_overlay", 0x38)
     local k_analysis = cfg_i("hotkey_toggle_analysis", 0x39)
@@ -3249,74 +3574,347 @@ end
 
 function m.on_overlay_on(ctx)
     m.ctx = ctx
+    note_event("overlay_on")
+    m.ev_stat.last_event = "overlay_on"
     m.overlay_seen = now_ms()
-    m.tick()
+    -- the Sider overlay is a *fallback* now: when the DLL renderer is drawing,
+    -- the overlay keeps its own status text, not a second set of cards
+    m.tick(nil, "overlay_on")
     -- the credit is drawn once at the top of the overlay, so it never touches
     -- the game picture itself
     return m.overlay_text()
 end
 
 -- ============================================================================
--- 20. Companion auto-launch
+-- 20. In-game renderer bridge (NGB_Render.dll)
 -- ============================================================================
-local launched = false
+-- The cards used to be drawn by a separate C# window (NGB_Overlay.exe) that a
+-- WinExec spawned. That is why nothing appeared when the game was unfocused,
+-- in exclusive fullscreen, or under a window the process-name guess missed.
+--
+-- The renderer is now a DLL loaded *into the game process* by this module:
+--
+--   Sider calls m.init(ctx)
+--        -> m.load_renderer()
+--        -> ffi.load(<sider>ngb-render\NGB_Render.dll)        (x64, same process)
+--        -> NGB_Start(config_utf8)                            (called from the
+--                                                              game thread)
+--
+-- The DLL finds the game's swapchain, hooks Present/ResizeBuffers, and draws
+-- the cards onto the game's own back buffer. No window of its own, no window
+-- search, no focus dependency, works in exclusive fullscreen.
+--
+-- Loading rules, in order:
+--   1. ini: renderer = dll        (default)
+--      ini: renderer = none       (draw nothing; Sider overlay text only)
+--      ini: renderer = overlay    (fall back to the C# window, if present)
+--   2. if FFI is off, ffi.load cannot be called -> log why, fall back.
+--   3. if the DLL is missing or refuses to start -> log why, fall back.
+-- Never silent: every branch logs one line with the reason.
+--
+-- Safety: the DLL is the only thing that ever touches the game's rendering.
+-- It does not read game memory, it does not write game files, and every hook
+-- is guarded by SEH with an automatic self-disable (see ngb-render/).
+m.renderer = {
+    wanted = "dll",
+    state = "not started",     -- "dll", "overlay", "none"
+    detail = "",
+    handle = nil,
+    started_at = 0,
+    last_error = "",
+}
 
-function m.launch_companion(ctx)
-    if launched then return end
-    if cfg_i("auto_launch_companion", 1) == 0 then return end
-    local sider = (ctx and ctx.sider_dir) or ""
-    if sider ~= "" then
-        local tail = string.sub(sider, -1)
-        if tail ~= "\\" and tail ~= "/" then sider = sider .. "\\" end
+-- FFI signatures for the loader. Declared once, guarded: a failed cdef here
+-- must not abort the module (that was problem 8).
+local function declare_loader()
+    if not ffi_ok then return false, "ffi unavailable (luajit.ext.enabled = 0)" end
+    if ffi.NGB_loader_cdefs then return true end
+    local ok = true
+    -- cdef returns nothing; a duplicate definition raises, so set the flag
+    -- only after the call and check the flag first (idempotent across reloads).
+    ffi.cdef [[
+        void *LoadLibraryA(const char *name);
+        int   FreeLibrary(void *handle);
+        void *GetProcAddress(void *handle, const char *name);
+        unsigned int SetErrorMode(unsigned int mode);
+    ]]
+    ffi.NGB_loader_cdefs = true
+    return true
+end
+
+-- LoadLibraryA helper with no FFI cdef risk: uses the raw symbol so a build
+-- whose cdef already declares LoadLibraryA (unlikely) still works.
+local function load_library(path)
+    local ok, err = declare_loader()
+    if not ok then return nil, err end
+    local h = C.LoadLibraryA(path)
+    if h == nil then return nil, "LoadLibraryA failed (file missing, or not x64)" end
+    -- luajit returns cdata; convert to a number so it can be compared/stored
+    return h, nil
+end
+
+local function get_proc(handle, name)
+    local fn = C.GetProcAddress(handle, name)
+    if fn == nil then return nil end
+    return fn
+end
+
+function m.renderer_path(ctx)
+    local sdir = (ctx and ctx.sider_dir) or ""
+    local tail = string.sub(sdir, -1)
+    if tail ~= "\\" and tail ~= "/" then sdir = sdir .. "\\" end
+    return sdir .. "ngb-render\\NGB_Render.dll"
+end
+
+-- Fire NGB_Start(config) once. config is a UTF-8 key=value block the DLL
+-- parses; it carries the state file path so the DLL never has to guess.
+function m.load_renderer(ctx)
+    m.renderer.wanted = string.lower(cfg_s("renderer", "dll"))
+    if m.renderer.wanted == "none" then
+        m.renderer.state = "none"
+        m.renderer.detail = "renderer = none in NGB_Presentation.ini"
+        log_msg("renderer: disabled by configuration (renderer = none)")
+        return false
     end
-    local candidates = {
-        sider .. "ngb-overlay\\NGB_Overlay.exe",
-        sider .. "ngb-overlay/NGB_Overlay.exe",
-        sider .. "..\\ngb-overlay\\NGB_Overlay.exe",
-        sider .. "overlay\\NGB_Overlay.exe",   -- older layout
-    }
-    local exe = nil
-    for i = 1, #candidates do
-        local f = io.open(candidates[i], "rb")
-        if f then
-            f:close()
-            exe = candidates[i]
-            break
+    if m.renderer.wanted ~= "dll" then
+        m.renderer.state = "overlay"
+        m.renderer.detail = "renderer = " .. m.renderer.wanted .. " (legacy window)"
+        log_msg("renderer: configured as '" .. m.renderer.wanted .. "' - using the C# overlay")
+        return false
+    end
+
+    local path = m.renderer_path(ctx)
+    local f = io.open(path, "rb")
+    if not f then
+        m.renderer.state = "overlay"
+        m.renderer.detail = "NGB_Render.dll not found at " .. path
+        log_msg("renderer: NO DLL at " .. path ..
+                " - falling back to the C# overlay. Re-run install.bat.")
+        return false
+    end
+    f:close()
+
+    if not ffi_ok then
+        m.renderer.state = "overlay"
+        m.renderer.detail = "ffi off - cannot LoadLibrary"
+        log_msg("renderer: luajit.ext.enabled = 0, so the DLL cannot be loaded. " ..
+                "Add that line to sider.ini, or the C# overlay is used instead.")
+        return false
+    end
+
+    local handle, err = load_library(path)
+    if not handle then
+        m.renderer.state = "overlay"
+        m.renderer.detail = tostring(err)
+        log_msg("renderer: " .. tostring(err) .. " - falling back to the C# overlay")
+        return false
+    end
+
+    local start = get_proc(handle, "NGB_Start")
+    if not start then
+        m.renderer.state = "overlay"
+        m.renderer.detail = "NGB_Start export missing"
+        log_msg("renderer: NGB_Render.dll has no NGB_Start export - wrong file? " ..
+                "Falling back to the C# overlay")
+        return false
+    end
+
+    -- config block: one KEY=VALUE per line, UTF-8, NUL-terminated by ffi
+    local cfgtext = table.concat({
+        "state_file=" .. tostring(m.state.path),
+        "log_file=" .. tostring(m.state.dir) .. "\\ngb-dll.log",
+        "version=" .. m.VERSION,
+        "debug=" .. tostring(cfg_i("debug_log", 0)),
+        "enabled=" .. tostring(cfg_i("dll_enabled", 1)),
+        "hotkey_kill=" .. tostring(cfg_i("dll_kill_hotkey", 0x77)),
+        "hotkey_selftest=" .. tostring(cfg_i("dll_selftest_hotkey", 0x77)),
+    }, "\n")
+
+    -- ffi.string of a Lua string -> const char*; the DLL copies it immediately
+    start(cfgtext)
+
+    local state_proc = get_proc(handle, "NGB_GetState")
+    m.renderer.handle = handle
+    m.renderer.state = "dll"
+    m.renderer.started_at = now_ms()
+    m.renderer.get_state = state_proc
+    m.renderer.detail = path
+    log_msg("renderer: NGB_Render.dll loaded and NGB_Start() called - " ..
+            "cards are drawn inside the game's own frame")
+    return true
+end
+
+-- Ask the DLL what it is doing (used by the diagnostics panel and state.json).
+-- Returns nil when the DLL is not loaded or the export is missing.
+function m.renderer_status()
+    if m.renderer.state ~= "dll" or not m.renderer.get_state then return nil end
+    local s = m.renderer.get_state()
+    if type(s) ~= "string" then return nil end
+    local t = {}
+    for k, v in string.gmatch(s, "([%w_]+)=([^;]*)") do t[k] = v end
+    return t
+end
+
+-- ============================================================================
+-- 20b. Startup diagnostics (STAGE 0)
+-- ============================================================================
+-- Everything in this block exists to answer "why is nothing showing?" without
+-- the player having to guess. It is deliberately cheap: no string formatting
+-- unless something actually happened.
+--
+-- The event table below is the verified list from the Sider 7.4 source
+-- (sider_context_register in sider.cpp). `register` is a void C function: it
+-- CANNOT report success. An unknown name is only reported by Sider itself, as
+--   WARN: trying to register for unknown event: "..."
+-- in sider.log, and ctx.register() still returns silently. So the module
+-- registers xpcall-free, then proves each handler by counting its first call
+-- in m.ev_fired. That is the only trustworthy "did it register" answer.
+m.events = {
+    -- name                = { wanted = bool, fired = 0, first = 0 }
+    display_frame         = { wanted = true },
+    overlay_on            = { wanted = true },
+    key_down              = { wanted = true },
+    set_teams             = { wanted = true },
+    set_match_settings    = { wanted = true },   -- real, verified in sider.cpp
+    goal_scored           = { wanted = true },   -- real, verified in sider.cpp
+    context_reset         = { wanted = true },
+    livecpk_data_ready    = { wanted = true },
+    show                  = { wanted = false },
+    hide                  = { wanted = false },
+}
+m.ev_stat = { display_frame = 0, tick = 0, ticks_from = "", state_writes = 0,
+              heartbeat_writes = 0, last_error = "" }
+
+-- Called at the top of every handler. Cheap: one table lookup + increment.
+function note_event(name)
+    local e = m.events[name]
+    if not e then return end
+    e.fired = (e.fired or 0) + 1
+    if not e.first then
+        e.first = now_ms()
+        log_msg(string.format("event '%s' fired for the first time (after %d ms)",
+            name, e.first))
+    end
+end
+m.note_event = note_event
+
+-- One line per registered event, at startup, in the documented Sider format.
+local function declare_events(ctx)
+    local names = { "display_frame", "overlay_on", "key_down", "set_teams",
+                    "set_match_settings", "goal_scored", "context_reset",
+                    "livecpk_data_ready" }
+    for i = 1, #names do
+        local n = names[i]
+        local handler = m.handler_for and m.handler_for[n]
+        if handler then
+            ctx.register(n, handler)
+            m.events[n].registered = true
+            log_msg("ctx.register(\"" .. n .. "\"): requested (Sider logs the result)")
+            -- Sider prints: > Registered for "x" event   (or WARN: unknown event)
+        else
+            log_msg("ctx.register(\"" .. n .. "\") SKIPPED: no handler on the module")
         end
     end
-    if not exe then
-        log_once("noexe",
-            "companion not built yet - run ngb-overlay\\Start_NGB_Overlay.bat once", 120000)
-        return
-    end
-    launched = true
+end
 
-    -- Preferred: WinExec through FFI - no console window flash, no cmd.exe.
-    if ffi_ok and C and C.NGB_WinExec then
-        local rc = C.NGB_WinExec('"' .. exe .. '"', 1)
-        if rc and rc > 31 then
-            log_msg("companion launched: " .. exe)
-            return
-        end
+-- Which Sider / LuaJIT / folder layout are we actually in?
+local function log_environment(ctx)
+    log_msg(string.format("%s v%s starting", m.NAME, m.VERSION))
+    log_msg("sider_dir = " .. tostring(ctx and ctx.sider_dir))
+    log_msg("lua = " .. tostring(_VERSION))
+    if jit and jit.version then log_msg("luajit = " .. tostring(jit.version)) end
+    log_msg("ffi = " .. tostring(ffi_ok) ..
+            "   bit = " .. tostring(bit ~= nil))
+    log_msg("memory lib = " .. tostring(mem_ok) ..
+            (mem_ok and "" or "  <-- READS DISABLED, no stats possible"))
+    log_msg("match lib = " .. tostring(match ~= nil and type(match.stats) == "function"))
+    log_msg("io.open, os.time, os.clock = " ..
+            tostring(io and io.open ~= nil) .. ", " ..
+            tostring(os and os.time ~= nil) .. ", " ..
+            tostring(os and os.clock ~= nil))
+    -- folder layout: FL26/27 installs use a SiderAddons folder; say which we see
+    local sdir = (ctx and ctx.sider_dir) or ""
+    local f = io.open(sdir .. "..\\SiderAddons\\sider.exe", "rb")
+    if f then f:close()
+        log_msg("folder layout: SiderAddons detected next to sider_dir")
     end
+    log_msg("renderer wanted = " .. tostring(cfg_s("renderer", "dll")))
+end
+m.log_environment = log_environment
 
-    -- Fallback: shell out with "start" (works even without FFI).
-    if io and io.popen then
-        local p = io.popen('start "" "' .. exe .. '"', "r")
-        if p then p:close() end
-        log_msg("companion launch requested: " .. exe)
-        return
+-- A compact "which events have fired" table for state.json / diagnostics.
+function m.event_snapshot()
+    local out = {}
+    local names = { "display_frame", "overlay_on", "key_down", "set_teams",
+                    "set_match_settings", "goal_scored", "context_reset",
+                    "livecpk_data_ready" }
+    for i = 1, #names do
+        local e = m.events[names[i]]
+        out[names[i]] = (e and e.fired) or 0
     end
+    return out
+end
 
-    log_msg("companion found but could not be started: " .. exe)
+-- ---- heartbeat -------------------------------------------------------------
+-- content\ngb-presentation\heartbeat.txt, rewritten at most once a second.
+-- It is the one file that proves "the module is alive and ticking": if it is
+-- not updating, the module is not running, whatever else the HUD says.
+function m.write_heartbeat(now)
+    if not m.state.dir then return false end
+    if (now - (m.hb.last or 0)) < 1000 then return false end
+    m.hb.last = now
+    local path = m.state.dir .. "\\heartbeat.txt"
+    local f = io.open(path, "wb")
+    if not f then return false end
+    local fired = {}
+    local names = { "display_frame", "overlay_on", "key_down", "set_teams",
+                    "set_match_settings", "goal_scored", "context_reset",
+                    "livecpk_data_ready" }
+    for i = 1, #names do
+        local e = m.events[names[i]]
+        fired[#fired + 1] = names[i] .. "=" .. tostring(e.fired or 0)
+    end
+    f:write(table.concat({
+        "module " .. m.VERSION,
+        "state_version " .. tostring(m.STATE_VERSION),
+        "at " .. os.date("%Y-%m-%d %H:%M:%S"),
+        "uptime_ms " .. tostring(now - (m.started_at or now)),
+        "last_event " .. tostring(m.ev_stat.last_event or "-"),
+        "ticks " .. tostring(m.ev_stat.tick),
+        "tick_source " .. tostring(m.ev_stat.ticks_from),
+        "state_writes " .. tostring(m.ev_stat.state_writes),
+        "heartbeat_writes " .. tostring(m.ev_stat.heartbeat_writes),
+        "renderer " .. tostring(m.renderer.state),
+        "score " .. tostring(m.eng.score.home) .. "-" .. tostring(m.eng.score.away),
+        "clock " .. m.clock_str(),
+        "data " .. m.data_source(),
+        "events " .. table.concat(fired, " "),
+        "last_error " .. tostring(m.ev_stat.last_error),
+    }, "\n") .. "\n")
+    f:close()
+    m.ev_stat.heartbeat_writes = m.ev_stat.heartbeat_writes + 1
+    return true
 end
 
 -- ============================================================================
 -- 21. init
 -- ============================================================================
+-- handler lookup used by declare_events(): keeps a single source of truth
+m.handler_for = {
+    display_frame      = function(ctx) return m.on_display_frame(ctx) end,
+    overlay_on         = function(ctx) return m.on_overlay_on(ctx) end,
+    key_down           = function(ctx, vkey) return m.on_key_down(ctx, vkey) end,
+    set_teams          = function(ctx, h, a) return m.on_set_teams(ctx, h, a) end,
+    set_match_settings = function(ctx) return m.on_set_teams(ctx) end,
+    goal_scored        = function(ctx, g) return m.on_goal_scored(ctx, g) end,
+    context_reset      = function(ctx) return m.on_context_reset(ctx) end,
+    livecpk_data_ready = function(ctx, ...) return m.on_livecpk_data_ready(ctx, ...) end,
+}
+
 function m.init(ctx)
     m.ctx = ctx
-    log_msg(string.format("%s v%s starting (Sider 7.3.4 / LuaJIT)", m.NAME, m.VERSION))
+    m.started_at = now_ms()
+    log_environment(ctx)
 
     -- configuration
     local sdir = ctx and ctx.sider_dir or ""
@@ -3353,15 +3951,9 @@ function m.init(ctx)
     m.apply_layout(m.read_calibration(m.state.dir), "calibration.txt")
     m.apply_layout(cfg, "NGB_Presentation.ini")
 
-    -- handlers (kept on m so the module table cannot be collected)
-    ctx.register("display_frame", m.on_display_frame)
-    ctx.register("livecpk_data_ready", m.on_livecpk_data_ready)
-    ctx.register("set_teams", m.on_set_teams)
-    ctx.register("set_match_settings", m.on_set_teams)
-    ctx.register("goal_scored", m.on_goal_scored)
-    ctx.register("context_reset", m.on_context_reset)
-    ctx.register("key_down", m.on_key_down)
-    ctx.register("overlay_on", m.on_overlay_on)
+    -- handlers, registered through the diagnostic table so each one is logged
+    -- and its first fire is timestamped (see declare_events above)
+    declare_events(ctx)
 
     -- replay camera pattern scan (cached for the whole session)
     m.cam_init()
@@ -3381,7 +3973,7 @@ function m.init(ctx)
     -- first state file so the companion can start straight away
     m.write_state(now_ms())
 
-    m.launch_companion(ctx)
+    m.load_renderer(ctx)
     log_msg("ready")
 end
 

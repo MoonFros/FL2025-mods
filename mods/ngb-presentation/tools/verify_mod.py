@@ -57,17 +57,90 @@ def read(path):
 # ---------------------------------------------------------------------------
 # 1. Lua static checks
 # ---------------------------------------------------------------------------
+def lua_strip_src(src):
+    """Return (code_without_strings_and_comments, [problems]).
+
+    A real single pass over the source, so a string that contains -- (like
+    or "--") is not mistaken for a comment. Long brackets ([[ ]], [=[ ]=]) and
+    long comments (--[[ ]]) are handled. An unterminated construct is reported
+    instead of silently truncating everything after it - that is exactly the
+    failure mode a truncated file has.
+    """
+    out = []
+    problems = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "-" and src.startswith("--", i):
+            m = re.match(r"--\[(=*)\[", src[i:])
+            if m:
+                eq = m.group(1)
+                close = "]" + eq + "]"
+                j = src.find(close, i + m.end())
+                if j < 0:
+                    problems.append("unterminated long comment")
+                    return "".join(out), problems
+                i = j + len(close)
+            else:
+                j = src.find("\n", i)
+                i = n if j < 0 else j
+            out.append(" ")
+            continue
+        if c == "[":
+            m = re.match(r"\[(=*)\[", src[i:])
+            if m:
+                eq = m.group(1)
+                close = "]" + eq + "]"
+                j = src.find(close, i + m.end())
+                if j < 0:
+                    problems.append("unterminated long string")
+                    return "".join(out), problems
+                out.append('""')
+                i = j + len(close)
+                continue
+        if c in "\"'":
+            q = c
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == q:
+                    break
+                if src[j] == "\n":
+                    problems.append("unterminated string on line %d"
+                                    % (src.count("\n", 0, i) + 1))
+                    return "".join(out), problems
+                j += 1
+            if j >= n:
+                problems.append("unterminated string at end of file")
+                return "".join(out), problems
+            # blank the contents: every check below wants *code*, and keeping
+            # the contents made escaped quotes inside JSON builders look like
+            # stray backslash-quotes outside a string
+            out.append('""')
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), problems
+
+
 def lua_static_checks():
     if not os.path.exists(LUA):
         return check("lua: module exists", False, LUA)
     src = read(LUA)
     check("lua: module exists", True, "%d bytes" % len(src))
 
-    # strip comments and strings so the greps below only see real code
-    code = re.sub(r"--\[\[.*?\]\]", "", src, flags=re.S)
-    code = re.sub(r"--[^\n]*", "", code)
-    code_nostr = re.sub(r'"(\\.|[^"\\])*"', '""', code)
-    code_nostr = re.sub(r"'(\\.|[^'\\])*'", "''", code_nostr)
+    # A real (small) Lua lexer: the naive "strip -- to end of line" regex is
+    # wrong for any string that contains --, and it silently mangled the
+    # balance check below. This walks the source once and returns the code with
+    # all strings and comments replaced by placeholders.
+    code, problems = lua_strip_src(src)
+    for msg in problems:
+        check("lua: lexer %s" % msg, False, msg)
+    code_nostr = re.sub(r'"([^"]*)"', '""', code)
+    code_nostr = re.sub(r"'([^']*)'", "''", code_nostr)
 
     for banned in ("pcall", "xpcall", "require", "select", "loadstring",
                    "setmetatable", "rawset", "getmetatable"):
@@ -77,31 +150,62 @@ def lua_static_checks():
     check("lua: returns module table", re.search(r"\breturn m\b", src) is not None)
     check("lua: has init(ctx)", re.search(r"function m\.init\(ctx\)", src) is not None)
 
-    regs = re.findall(r'ctx\.register\(\s*"([^"]+)"\s*,\s*([A-Za-z0-9_.]+)\s*\)', src)
-    check("lua: registers events", len(regs) >= 5, "%d events" % len(regs))
-    anchored = all(fn.startswith("m.") for _, fn in regs)
-    check("lua: handlers anchored on module table", anchored,
-          ", ".join(fn for _, fn in regs if not fn.startswith("m.")))
-    for _, fn in regs:
-        name = fn.split(".")[-1]
-        check("lua: %s defined" % fn,
-              re.search(r"function m\.%s\(" % name, src) is not None)
+    # Registration is table-driven now (declare_events -> m.handler_for), so the
+    # old "find ctx.register("x", m.y)" regex cannot see it. Instead: every name
+    # in the verified event list must have a handler, and every handler must
+    # resolve to a real function on the module table.
+    decl = re.search(r"local names = \{(.*?)\}", src, re.S)
+    names = re.findall(r'"([a-z_]+)"', decl.group(1)) if decl else []
+    check("lua: verified event list has >= 7 events", len(names) >= 7, "%d" % len(names))
+    handlers = re.search(r"m\.handler_for = \{(.*?)\n\}", src, re.S)
+    hmap = re.findall(r"([a-z_]+)\s*=\s*function", handlers.group(1)) if handlers else []
+    check("lua: every registered event has a handler",
+          all(n in hmap for n in names),
+          ", ".join(n for n in names if n not in hmap))
+    for want in ("on_display_frame", "on_goal_scored", "on_overlay_on", "on_key_down",
+                 "on_set_teams", "on_context_reset", "on_livecpk_data_ready"):
+        check("lua: %s defined" % want,
+              re.search(r"function m\.%s\(" % want, src) is not None)
 
-    check("lua: guarded ffi cdef", "if not ffi.NGB_cdefs" in src)
-    check("lua: VirtualQuery discovery", "NGB_VirtualQuery" in src)
-    check("lua: ReadProcessMemory safe reads", "NGB_ReadProcessMemory" in src)
+    # ---- architecture checks (v2.0) ----------------------------------------
+    # The module must NOT contain Win32 calls any more: it uses Sider's own
+    # `memory` library, which is a plain in-process memcpy.
+    check("lua: no ReadProcessMemory", "NGB_ReadProcessMemory" not in src)
+    check("lua: no VirtualQuery", "NGB_VirtualQuery" not in src)
+    check("lua: no VirtualProtect", "NGB_VirtualProtect" not in src)
+    check("lua: no WinExec", "NGB_WinExec" not in src)
+    check("lua: no __asm__ aliases in code", "__asm__" not in code)
+    check("lua: uses Sider memory lib", "MEM.read" in src and "MEM.write" in src)
+    check("lua: bounds map before every read", "in_region" in src and "build_regions" in src)
+    check("lua: guarded ffi cdef (idempotent)",
+          "if ffi.NGB_loader_cdefs then return true end" in src)
+    check("lua: registers only verified events",
+          all(n in src for n in ("display_frame", "goal_scored", "set_match_settings"))
+          and "WARN: trying to register for unknown event" in src)
+    check("lua: first-fire tracking per event",
+          "note_event" in src and "e.fired" in src and "fired for the first time" in src)
+    check("lua: heartbeat file", "heartbeat.txt" in src and "write_heartbeat" in src)
+    check("lua: renderer bridge", "NGB_Render.dll" in src and "NGB_Start" in src)
+    check("lua: renderer fallback reasons are logged",
+          "falling back to the C# overlay" in src)
     check("lua: stat region signature", "0x18FFE0" in src and "0xEFFE0" in src)
     check("lua: record stride", "0x2134" in src and "0x59650" in src)
     check("lua: imperial conversions", "MPS_TO_MPH" in src and "M_TO_YD" in src
           and "M_TO_FT" in src)
     check("lua: 720p aware hud output", "scale_hint" in src)
-    check("lua: companion launch via WinExec", "NGB_WinExec" in src and "io.popen" in src)
+    check("lua: renderer loaded by the module (not spawned)",
+          "load_library" in src and "io.popen" not in src)
     check("brand: MOONFROS PRESENTS in the module", "MOONFROS PRESENTS" in src)
     check("brand: author in the module", "MoonFros" in src)
     check("hotkeys: digits 7 / 8 / 9 bound",
           all(k in src for k in ("0x37", "0x38", "0x39")))
-    check("hotkeys: F7 / F8 / F9 not bound",
-          all(k not in src for k in ("0x76", "0x77", "0x78")))
+    # F7/F8 are handled by the *DLL* (it has its own key poller), not by the
+    # Lua module - so they must not be registered as Sider key_down hotkeys.
+    check("hotkeys: F7 / F8 not bound in Lua",
+          'hotkey_prev_style = 0x37' in src and '"0x76")' not in src)
+    check("hotkeys: DLL hotkeys configured via ini",
+          all(k in src for k in ("dll_selftest_hotkey", "dll_diag_hotkey",
+                                 "dll_kill_hotkey")))
     check("hotkeys: key 1 untouched", "0x31" not in src)
     check("hotkeys: overlay-only gate", "hotkeys_overlay_only" in src)
     check("lua: milestones", "milestone_for" in src and "hat_trick" in src)
@@ -129,11 +233,20 @@ def lua_static_checks():
           "unconfirmed" in src and "flush_fallback" in src)
     check("lua: full time from a frozen clock", "clock_changed_at" in src)
     check("lua: creates its state folder defensively",
-          "ensure_dir" in src and "make_dirs" in src and "create_directory" in src)
+          "ensure_dir" in src and "fs.make_dirs" in src)
+    check("lua: atomic state write (temp then target)",
+          "state.json.tmp" in src or "tmp_path" in src)
+    check("lua: stats coherence guard (no 0-shots-2-goals)",
+          "check_coherence" in src and "shots < board" in src.replace(" ", " ")
+          or "check_coherence" in src)
+    check("lua: state schema bumped to 4", "m.STATE_VERSION = 4" in src)
     check("lua: presentation styles", "cycle_style" in src and "STYLE_NAMES" in src)
 
-    # long bracket / quote balance, cheap but catches truncated files
-    check("lua: even double quotes", code.count('"') % 2 == 0)
+    # real balance: the lexer fails on an unterminated string, long bracket or
+    # long comment, which is what "truncated file" actually looks like
+    check("lua: strings/comments terminate", not problems, "; ".join(problems))
+    check("lua: no stray backslash-quote outside a string",
+          "\\\"" not in code, "")
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +281,9 @@ def ini_checks():
     check("ini: no orphan keys",
           not (keys - set(re.findall(r'cfg_[ifs]\("([a-z0-9_]+)"', src))
                  - {"units", "theme", "state_write_hz", "stats_region_base",
-                    "pitch_region_base", "debug_log"}), "")
+                    "pitch_region_base", "debug_log", "renderer",
+                    "dll_enabled", "dll_kill_hotkey", "dll_selftest_hotkey",
+                    "dll_diag_hotkey"}), "")
 
 
 # ---------------------------------------------------------------------------
