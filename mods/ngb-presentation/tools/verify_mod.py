@@ -803,6 +803,20 @@ def packaging_checks():
               "__try" in tech and "SEH" in tech)
         check("docs: TECHNICAL no longer claims ReadProcessMemory",
               "the mod reads through **`ReadProcessMemory`**" not in tech)
+        # the sandbox facts must carry their provenance, and the memory story
+        # must name the real problem (Sider's read is ffi.string, not a memcpy)
+        check("docs: TECHNICAL cites the Sider sandbox source",
+              "push_env_table" in tech and "sider.cpp:6566" in tech
+              and "lua_setfenv" in tech)
+        check("docs: TECHNICAL states memory.read is a raw dereference",
+              "ffi.string" in tech and "access violation" in tech)
+        check("docs: TECHNICAL documents the safe memory API",
+              all(k in tech for k in ("NGB_Read", "NGB_Write", "NGB_Query",
+                                      "ReadProcessMemory", "VirtualQuery")))
+        check("docs: TECHNICAL documents allow_unsafe_memory_reads",
+              "allow_unsafe_memory_reads" in tech)
+        check("docs: CHANGELOG records problem 11", "## 11." in chg and "memory.lua" in chg)
+        check("docs: README explains the MEMORY strip line", "MEMORY" in doc)
 
     check("docs: technical reference present",
           os.path.exists(os.path.join(ROOT, "docs", "TECHNICAL.md")))

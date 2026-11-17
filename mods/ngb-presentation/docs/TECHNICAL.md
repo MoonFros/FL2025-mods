@@ -47,7 +47,16 @@ has everything; the module only gets the table above.
 | `ffi.cdef` is global to the LuaJIT state | the only declarations are the seven Win32 loader/identity calls below, declared once behind `ffi.NGB_loader_cdefs` (idempotent across Sider hot-reloads) |
 | `os` has no `remove`/`rename`/`getenv`/`exit` | nothing can delete, move or spawn anything; files are only written through `fs` (see also: a Windows `os.rename` cannot overwrite, which is the second reason the module never uses it) |
 
-The complete FFI surface, in 2.0:
+### 1.0 Why an access violation was possible at all
+
+`memory.read` is a bare dereference, and the module sandbox has no `pcall`, so a
+stale pointer is an **access violation inside the game process** - not a Lua
+error, not something `lua_pcall` in Sider can catch. That was problem 11
+(`memory.read` returned `ffi.string(addr, len)` with no page check); the fix is
+that reads go through the DLL's `NGB_Read`, i.e. `ReadProcessMemory` on our own
+process, which reports a partial read instead of faulting.
+
+The complete FFI surface remaining in the Lua module:
 
 ```c
 void *LoadLibraryA(const char *name);

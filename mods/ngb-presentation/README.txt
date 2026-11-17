@@ -362,6 +362,15 @@ and nothing is filled with zeros to look complete.
                                          sider.ini.
          "event": null during a goal ... no goal was detected. Check
                                          status.data.scorer_hook.
+         player numbers all "UNAVAILABLE"  the memory backend is off. Look for
+                                         "MEMORY" in the F7 strip (Sider overlay):
+                                           dll .................. normal
+                                           none ................. no DLL, so no
+                                                                   safe reader
+                                           SIDER RAW ............ you set
+                                                                   allow_unsafe_memory_reads
+                                                                   = 1; the game
+                                                                   can crash
 
     4. Numbers look wrong
        diag.stats_coherent / status.data.stats_coherent is false when the player

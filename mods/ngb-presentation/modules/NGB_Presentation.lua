@@ -3385,6 +3385,20 @@ function m.overlay_text()
 
         local written = m.state.last_write or 0
         local age = (written > 0) and (now_ms() - written) or -1
+        -- the memory backend decides whether live numbers exist at all, so it
+        -- belongs in the strip, not only in the log
+        local mb = MEM_BACKEND
+        if mb == "dll" then
+            mb = "dll (ReadProcessMemory - safe)"
+        elseif mb == "sider-unsafe" then
+            mb = "SIDER RAW (<-- can crash; allow_unsafe_memory_reads = 1)"
+        elseif mb == "sim" then
+            mb = "simulated (test harness)"
+        else
+            mb = "none -> live player numbers OFF (install ngb-render\\NGB_Render.dll)"
+        end
+        out[#out + 1] = "MEMORY    " .. mb
+
         out[#out + 1] = string.format("STATE     %s   age %s   writes %d ok / %d failed",
             tostring(m.state.path or "none"),
             (age >= 0 and (tostring(age) .. " ms")) or "never",

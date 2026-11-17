@@ -810,6 +810,15 @@ check("heartbeat: matching version is reported as running",
 if cdir then os.remove(cdir .. "/overlay_alive.txt") end
 
 -- ---------------------------------------------------------------------------
+-- the overlay must name the memory backend: "player numbers are missing" is
+-- the most common report, and the strip has to answer it in one line
+local panel = m.overlay_text()
+check("overlay: names the memory backend",
+      string.find(panel, "MEMORY", 1, true) ~= nil
+      and string.find(panel, "simulated", 1, true) ~= nil,
+      (string.match(panel, "MEMORY[^\n]*") or ""))
+
+-- ---------------------------------------------------------------------------
 -- Memory safety: with no fault-free backend the module must fail closed.
 -- Sider's `memory.read` is a raw ffi.string, so "fail closed" is the only
 -- acceptable behaviour when the DLL is missing.

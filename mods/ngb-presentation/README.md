@@ -91,6 +91,7 @@ Press **F8** in game.
 | what you see | meaning | what to do |
 |---|---|---|
 | no `ngb-dll.log` at all | the Lua module never tried to load the DLL | check `sider.log` for `renderer: NO DLL at ...` or `renderer: disabled by configuration` |
+| `MEMORY   none` in the F7 strip | no safe memory reader, so live player numbers are off on purpose | install `ngb-render\NGB_Render.dll`; do not set `allow_unsafe_memory_reads` |
 | `renderer: NO DLL at ...` in `sider.log` | the file is not where the module looks | re-run `install.bat`; the file must be `<Sider>\ngb-render\NGB_Render.dll` |
 | `ffi off - cannot LoadLibrary` | `luajit.ext.enabled` is not 1 | add it to `sider.ini`, or re-run `install.bat` |
 | `LoadLibraryA failed` | wrong file / wrong architecture | the DLL must be the 64-bit `NGB_Render.dll` from this package |
