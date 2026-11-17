@@ -31,6 +31,7 @@ import re
 import struct
 import sys
 import subprocess
+import shutil
 import tempfile
 import zlib
 
@@ -529,6 +530,9 @@ def player_bin_fixture():
 # ---------------------------------------------------------------------------
 # 6. Functional run through lupa (LuaJIT)
 # ---------------------------------------------------------------------------
+_last_state_json = ""
+
+
 def lua_runtime_checks(verbose=False):
     try:
         import lupa.luajit21 as lj
@@ -583,10 +587,12 @@ def lua_runtime_checks(verbose=False):
     check("lua functional: assertions", n >= 30, "%d assertions" % n)
 
     # state.json produced by the harness
+    global _last_state_json
     state_path = os.path.join(sider, "content", "ngb-presentation", "state.json")
     if os.path.exists(state_path):
         with open(state_path, encoding="utf-8") as fh:
             raw = fh.read()
+        _last_state_json = raw
         try:
             st = json.loads(raw)
             check("state: valid json", True, "%d bytes" % len(raw))
@@ -661,19 +667,29 @@ def packaging_checks():
     check("install: scans every drive", re.search(r"for %%D in \(C D E", src) is not None
           or re.search(r"for %%d in \(c d e", low) is not None)
     check("install: accepts drag & drop / argument", "%~1" in src)
-    check("install: copies module + overlay",
-          "NGB_Presentation.lua" in src and "ngb-overlay" in low)
+    check("install: copies the module", "NGB_Presentation.lua" in src)
+    check("install: installs the renderer DLL",
+          "NGB_Render.dll" in src and "ngb-render" in low)
+    # problem 10: no compiler, no second window, nothing for the user to build
+    check("install: needs no compiler (problem 10)",
+          "csc" not in low and "csc.exe" not in low)
+    check("install: keeps the C# overlay as an optional fallback",
+          "ngb-overlay" in low and "fallback" in low)
     check("install: never deletes anything", not any(
         t in low for t in ("del /s", "del /q", "rd /s", "format ", "deltree")))
-    check("install: builds + starts the overlay", "start_ngb_overlay.bat" in low)
+    check("install: starts no second window", "start_ngb_overlay.bat" not in low)
     check("install: writes a log", "install_log.txt" in low)
     check("install: mentions match-stats in the manual fallback", "match-stats.enabled" in low)
-    check("install: stops when the overlay does not compile",
+    check("install: stops when the renderer DLL is missing",
           "build_failed" in low and "install incomplete" in low)
-    with open(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat"),
-              encoding="utf-8", errors="replace") as fh:
-        starter = fh.read().lower()
-    check("start script: warns about a stale exe", "older ngb_overlay.exe" in starter)
+    check("install: names every log file in the success message",
+          all(k in low for k in ("sider.log", "ngb-dll.log", "heartbeat.txt",
+                                 "render.txt")))
+    if os.path.exists(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat")):
+        with open(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat"),
+                  encoding="utf-8", errors="replace") as fh:
+            starter = fh.read().lower()
+        check("start script: warns about a stale exe", "older ngb_overlay.exe" in starter)
     check("install: creates the runtime state folder",
           re.search(r"content\\ngb-presentation", src) is not None
           and "mkdir" in low)
@@ -688,6 +704,25 @@ def packaging_checks():
     check("ini editor: backs the file up", ".ngb.bak" in ps)
     check("ini editor: inserts next to other modules", "lua.module" in ps and "Insert" in ps)
     check("ini editor: can remove the entry", "remove" in ps)
+    # PROBLEM 9 regression gate. An `else` that follows a bare statement is a
+    # parse error, and PowerShell then refuses to run the whole script - which
+    # is exactly how uninstall.bat ended up failing. Braces must balance and
+    # every else must hang off a closing brace.
+    check("ini editor: braces balance", ps.count("{") == ps.count("}"),
+          "%d { vs %d }" % (ps.count("{"), ps.count("}")))
+    bad_else = []
+    pl = ps.splitlines()
+    for i, line in enumerate(pl):
+        t = line.strip()
+        if t.startswith("else") and not t.startswith("} else"):
+            prev = pl[i - 1].strip() if i else ""
+            if not (prev.endswith("}") or prev.startswith("elseif")
+                    or prev.startswith("if ") or prev.startswith("}")):
+                bad_else.append("line %d: %s" % (i + 1, t))
+    check("ini editor: no dangling else (problem 9)", not bad_else,
+          "; ".join(bad_else[:2]))
+    check("ini editor: never overwrites the first backup",
+          "Test-Path -LiteralPath ($Ini + '.ngb.bak')" in ps)
 
     if not os.path.exists(unin):
         check("uninstall: script present", False, unin)
@@ -698,6 +733,8 @@ def packaging_checks():
         check("uninstall: asks for confirmation", "choice /c yn" in ulow)
         check("uninstall: removes only mod files",
               "ngb_presentation.lua" in ulow and "ngb-overlay" in ulow)
+        check("uninstall: removes the renderer DLL",
+              "ngb-render" in ulow and "ngb_render.dll" in ulow)
         check("uninstall: guards foreign overlay folds", "ngb_overlay.cs" in ulow)
         check("uninstall: unregisters only its line", "-mode remove" in ulow)
         wild = re.findall(r'del\s+/[a-z]*q?[a-z]*\s+"?[^"\r\n]*\*', ulow)
@@ -728,7 +765,203 @@ def packaging_checks():
     check("preview: interactive preview present", os.path.exists(HTML))
 
 
+
 # ---------------------------------------------------------------------------
+# 7. DLL renderer: source checks, a real build, and host unit tests
+# ---------------------------------------------------------------------------
+RENDER = os.path.join(ROOT, "ngb-render")
+
+
+def pe_info(path):
+    """machine + exported names of a PE file, without any external tooling."""
+    with open(path, "rb") as fh:
+        d = fh.read()
+    if d[:2] != b"MZ":
+        return None, []
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    if d[pe:pe + 4] != b"PE\0\0":
+        return None, []
+    machine = struct.unpack_from("<H", d, pe + 4)[0]
+    nsec = struct.unpack_from("<H", d, pe + 6)[0]
+    opt = struct.unpack_from("<H", d, pe + 20)[0]
+    magic = struct.unpack_from("<H", d, pe + 24)[0]
+    ddoff = pe + 24 + (112 if magic == 0x20B else 96)
+    exp_rva = struct.unpack_from("<I", d, ddoff)[0]
+    secs = []
+    for i in range(nsec):
+        o = pe + 24 + opt + 40 * i
+        vsize, va, rsize, roff = struct.unpack_from("<IIII", d, o + 8)
+        secs.append((va, max(vsize, rsize), roff))
+
+    def r2o(rva):
+        for va, size, roff in secs:
+            if va <= rva < va + size:
+                return roff + (rva - va)
+        return None
+
+    names = []
+    if exp_rva:
+        eo = r2o(exp_rva)
+        if eo:
+            nnames = struct.unpack_from("<I", d, eo + 24)[0]
+            names_rva = struct.unpack_from("<I", d, eo + 32)[0]
+            no = r2o(names_rva)
+            if no:
+                for i in range(nnames):
+                    nr = struct.unpack_from("<I", d, no + 4 * i)[0]
+                    o = r2o(nr)
+                    if o:
+                        end = d.index(b"\0", o)
+                        names.append(d[o:end].decode("ascii", "replace"))
+    return machine, names
+
+
+def dll_checks(verbose=False):
+    if not os.path.isdir(RENDER):
+        return check("dll: project present", False, RENDER)
+    check("dll: project present", True)
+
+    src = read(os.path.join(RENDER, "src", "ngb_render.c"))
+    gfx = read(os.path.join(RENDER, "src", "ngb_gfx.c"))
+    card = read(os.path.join(RENDER, "src", "ngb_card.c"))
+    jsrc = read(os.path.join(RENDER, "src", "ngb_json.c"))
+    allc = src + gfx + card + jsrc
+
+    # ---- what it must do -------------------------------------------------
+    check("dll: hooks Present + ResizeBuffers",
+          "vtbl[8]" in src and "vtbl[13]" in src, "dxgi swapchain vtbl")
+    check("dll: uses MinHook", "MH_CreateHook" in src and "MH_EnableHook" in src)
+    check("dll: probe device/swapchain", "D3D11CreateDeviceAndSwapChain" in src)
+    src_code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    src_code = re.sub(r"//[^\n]*", "", src_code)
+    check("dll: probe window is private, never the foreground window",
+          "GetForegroundWindow" not in src_code and "WS_EX_TOOLWINDOW" in src_code)
+    check("dll: exports NGB_Start / NGB_GetState",
+          "__declspec(dllexport) int NGB_Start" in src and "NGB_GetState" in src)
+    check("dll: releases size-dependent objects before ResizeBuffers",
+          "ngb_gfx_shutdown_keep_hook()" in src and
+          src.index("ngb_gfx_shutdown_keep_hook()") <
+          src.index("s_resize_orig(sc, count, w, h, fmt, flags)"))
+    check("dll: writes exactly one file of its own",
+          src.count("GENERIC_WRITE") == 1)
+    check("dll: reads state.json only",
+          "state_file" in src and "match.home.abbr" in src)
+    check("dll: touches no game memory offsets",
+          "0x7B5C0" not in allc and "0x120" not in allc)
+
+    # ---- crash safety ----------------------------------------------------
+    check("dll: hardware SEH around the Present body",
+          "__try {" in src and "__except (EXCEPTION_EXECUTE_HANDLER)" in src)
+    check("dll: a fault disables the renderer, not the game",
+          "g_dead, 1" in src and "Renderer disabled, game left running" in src)
+    check("dll: re-entrancy guard in the hook", "s_in_present" in src)
+    check("dll: kill-switch hotkey", "hk_kill" in src and "GetAsyncKeyState" in src)
+    check("dll: dll_enabled = 0 installs no hooks",
+          "if (!g_cfg.enabled)" in src and "not installing hooks" in src)
+    check("dll: file IO runs off the render thread",
+          "CreateThread" in src and "poll_thread" in src)
+    check("dll: every failure path logs", src.count("ngb_log(") > 20,
+          "%d log calls" % src.count("ngb_log("))
+    check("dll: state age comes from the file's write time",
+          "GetFileTime" in src)
+
+    # ---- rendering quality ----------------------------------------------
+    check("dll: state save/restore around the frame",
+          "OMGetRenderTargets" in gfx and "RSGetViewports" in gfx)
+    check("dll: alpha blended quads", "D3D11_BLEND_SRC_ALPHA" in gfx)
+    check("dll: text is a GDI mask + cached texture",
+          "TextOutW" in gfx and "text_ent" in gfx)
+    check("dll: shaders compiled at runtime", "d3dcompiler_47.dll" in gfx)
+    card_code = re.sub(r"/\*.*?\*/", "", card, flags=re.S)
+    card_code = re.sub(r"//[^\n]*", "", card_code)
+    check("dll: no fixed resolution in the layout",
+          "1920" not in card_code and "h / 1080.0f" in card_code)
+    check("dll: unknown scorer is labelled, never invented",
+          "SCORER NOT AVAILABLE" in card)
+    check("dll: unvalidated stats are labelled", "PLAYER DATA UNAVAILABLE" in card)
+    check("dll: measured vs modelled is shown",
+          "MODELLED" in card and "MEASURED" in card)
+    check("dll: score bug only while a match is live", "st->live" in card)
+    check("dll: self-test is stamped DEMO", "DEMO - NOT REAL DATA" in card)
+    check("dll: json reader is bounds checked",
+          "skip_value" in jsrc and "ngb_json_path" in jsrc)
+    check("dll: result card listens for kind=fulltime",
+          '"fulltime"' in card and '"half_time"' in card)
+
+    # ---- is the shipped DLL the real thing? ------------------------------
+    shipped = os.path.join(RENDER, "NGB_Render.dll")
+    if not os.path.exists(shipped):
+        check("dll: prebuilt DLL shipped", False, "ngb-render/NGB_Render.dll")
+    else:
+        machine, names = pe_info(shipped)
+        check("dll: prebuilt DLL shipped", True,
+              "%.0f KB" % (os.path.getsize(shipped) / 1024.0))
+        check("dll: prebuilt DLL is x64", machine == 0x8664, hex(machine or 0))
+        check("dll: prebuilt DLL exports the API",
+              all(n in names for n in ("NGB_Start", "NGB_GetState", "NGB_Stop")),
+              ", ".join(names) or "no exports")
+
+    # ---- rebuild from source --------------------------------------------
+    zig = shutil.which("zig") or os.environ.get("ZIG")
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    build_dir = tempfile.mkdtemp(prefix="ngb_dll_")
+
+    if zig and os.path.exists(zig):
+        out = os.path.join(build_dir, "NGB_Render.dll")
+        cmd = [zig, "cc", "-target", "x86_64-windows-gnu", "-O2", "-shared",
+               "-fms-extensions", "-o", out]
+        cmd += [os.path.join("src", f) for f in
+                ("ngb_render.c", "ngb_gfx.c", "ngb_card.c", "ngb_json.c")]
+        cmd += [os.path.join("minhook", "src", f) for f in
+                ("hook.c", "buffer.c", "trampoline.c", os.path.join("hde", "hde64.c"))]
+        cmd += ["-I", os.path.join("minhook", "include"), "-I", "src",
+                "-ld3d11", "-ldxgi", "-lgdi32", "-luser32", "-lole32", "-loleaut32"]
+        try:
+            proc = subprocess.run(cmd, cwd=RENDER, capture_output=True, timeout=900)
+            ok_build = proc.returncode == 0 and os.path.exists(out)
+            detail = "" if ok_build else proc.stderr.decode("utf-8", "replace")[-400:]
+            check("dll: builds from source (zig cc)", ok_build, detail)
+            if ok_build:
+                machine, names = pe_info(out)
+                check("dll: fresh build is x64 with the API",
+                      machine == 0x8664 and "NGB_Start" in names, hex(machine or 0))
+        except Exception as exc:  # noqa: BLE001
+            check("dll: builds from source (zig cc)", None, str(exc)[:200])
+    else:
+        check("dll: builds from source (zig cc)", None, "skipped (no zig)")
+
+    # ---- host unit tests: json reader + card geometry --------------------
+    if cc:
+        for name, files, extra in (
+                ("json", ["tests/json_test.c", "src/ngb_json.c"], []),
+                ("card", ["tests/card_test.c", "src/ngb_card.c"], ["-lm"])):
+            exe = os.path.join(build_dir, name + "_test")
+            cmd = [cc, "-DNGB_HOST_TEST", "-I", "src", "-o", exe] + files + extra
+            try:
+                proc = subprocess.run(cmd, cwd=RENDER, capture_output=True, timeout=180)
+                if proc.returncode != 0:
+                    check("dll: %s test compiles" % name, False,
+                          proc.stderr.decode("utf-8", "replace")[-300:])
+                    continue
+                check("dll: %s test compiles" % name, True)
+                args = [exe]
+                if name == "json" and _last_state_json:
+                    sample = os.path.join(build_dir, "state.json")
+                    with open(sample, "w", encoding="utf-8") as fh:
+                        fh.write(_last_state_json)
+                    args.append(sample)
+                proc = subprocess.run(args, cwd=RENDER, capture_output=True, timeout=180)
+                out = proc.stdout.decode("utf-8", "replace")
+                tail = [l for l in out.splitlines()
+                        if l.startswith("PASSED") or l.startswith("FAILED")]
+                check("dll: %s test passes" % name, proc.returncode == 0,
+                      tail[-1] if tail else out[-200:])
+            except Exception as exc:  # noqa: BLE001
+                check("dll: %s test compiles" % name, None, str(exc)[:200])
+    else:
+        check("dll: host unit tests", None, "skipped (no cc)")
+
+
 # ---------------------------------------------------------------------------
 # 7b. Calibration tool
 # ---------------------------------------------------------------------------
@@ -770,6 +1003,7 @@ def main():
     packaging_checks()
     calibration_checks()
     lua_runtime_checks(verbose)
+    dll_checks(verbose)
 
     failed = [r for r in results if r[1] is False]
     skipped = [r for r in results if r[1] is None]

@@ -3805,19 +3805,34 @@ function m.load_renderer(ctx)
         return false
     end
 
-    -- config block: one KEY=VALUE per line, UTF-8, NUL-terminated by ffi
+    -- Config block: KEY=VALUE pairs. The DLL accepts both ';' and newlines as
+    -- separators (a Lua string with embedded newlines is awkward through ffi,
+    -- so ';' is what we send).
+    local dir = tostring(m.state.dir)
+    if string.sub(dir, -1) ~= "\\" and string.sub(dir, -1) ~= "/" then dir = dir .. "\\" end
     local cfgtext = table.concat({
         "state_file=" .. tostring(m.state.path),
-        "log_file=" .. tostring(m.state.dir) .. "\\ngb-dll.log",
+        "log_file=" .. dir .. "ngb-dll.log",
+        "dir=" .. dir,
         "version=" .. m.VERSION,
         "debug=" .. tostring(cfg_i("debug_log", 0)),
         "enabled=" .. tostring(cfg_i("dll_enabled", 1)),
-        "hotkey_kill=" .. tostring(cfg_i("dll_kill_hotkey", 0x77)),
         "hotkey_selftest=" .. tostring(cfg_i("dll_selftest_hotkey", 0x77)),
-    }, "\n")
+        "hotkey_diag=" .. tostring(cfg_i("dll_diag_hotkey", 0x76)),
+        "hotkey_kill=" .. tostring(cfg_i("dll_kill_hotkey", 0x7B)),
+    }, ";")
 
     -- ffi.string of a Lua string -> const char*; the DLL copies it immediately
-    start(cfgtext)
+    local started = start(cfgtext)
+    if not started or tonumber(started) == 0 then
+        -- the DLL refused (no probe swapchain, MinHook failed, ...). It has
+        -- already written the reason to ngb-dll.log; do not pretend it worked.
+        m.renderer.state = "overlay"
+        m.renderer.detail = "NGB_Start returned 0 - see " .. dir .. "ngb-dll.log"
+        log_msg("renderer: NGB_Start reported failure; the C# overlay is the " ..
+                "fallback. Reason is in " .. dir .. "ngb-dll.log")
+        return false
+    end
 
     local state_proc = get_proc(handle, "NGB_GetState")
     m.renderer.handle = handle

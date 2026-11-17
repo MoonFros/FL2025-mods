@@ -78,9 +78,10 @@ if not exist "%SIDER%\modules\NGB_Presentation.lua" (
 echo  This will remove:
 echo     modules\NGB_Presentation.lua
 echo     modules\NGB_Presentation.ini
-echo     ngb-overlay\           (the overlay and its build)
-echo     content\ngb-presentation\   (runtime state file)
-echo     the mod's two lines in sider.ini
+echo     ngb-render\            (the renderer DLL)
+echo     ngb-overlay\           (the optional fallback, if present)
+echo     content\ngb-presentation\   (state, logs, heartbeat)
+echo     the mod's lines in sider.ini
 echo.
 echo  Nothing else is deleted.
 echo.
@@ -97,6 +98,13 @@ timeout /t 1 >nul
 if exist "%SIDER%\modules\NGB_Presentation.lua" del /q "%SIDER%\modules\NGB_Presentation.lua"
 if exist "%SIDER%\modules\NGB_Presentation.ini" del /q "%SIDER%\modules\NGB_Presentation.ini"
 echo  modules\NGB_Presentation.*              removed
+
+if exist "%SIDER%\ngb-render\NGB_Render.dll" (
+    rd /s /q "%SIDER%\ngb-render"
+    echo  ngb-render\                            removed (renderer DLL)
+) else (
+    if exist "%SIDER%\ngb-render" echo  ngb-render\ looks foreign - left untouched
+)
 
 if exist "%SIDER%\ngb-overlay\NGB_Overlay.cs" (
     rd /s /q "%SIDER%\ngb-overlay"
@@ -122,6 +130,7 @@ if errorlevel 1 (
     echo      Open %SIDER%\sider.ini and delete the line
     echo         lua.module = "NGB_Presentation.lua"
     echo      then save.  Everything else is already removed.
+    echo      (A backup of the original file is sider.ini.ngb.bak.)
     pause
 )
 

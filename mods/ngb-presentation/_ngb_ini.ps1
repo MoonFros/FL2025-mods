@@ -96,13 +96,24 @@ else {
             $lines.RemoveAt($i); $changed = $true
         }
     }
-    if ($changed) { Write-Host "  sider.ini : module entry removed" }
-    Write-Host "  sider.ini : match-stats.enabled left as it is (other mods may use it)"
-    else { Write-Host "  sider.ini : nothing to remove" }
+    # PROBLEM 9 (fixed): the else below used to sit after a bare Write-Host,
+    # which is a parse error - PowerShell refused to run the whole script, so
+    # uninstall.bat errored out and sider.ini was never saved. Braces now.
+    if ($changed) {
+        Write-Host "  sider.ini : module entry removed"
+        Write-Host "  sider.ini : luajit.ext.enabled / match-stats.enabled left as they are (other mods may need them)"
+    } else {
+        Write-Host "  sider.ini : nothing to remove"
+    }
 }
 
 if ($changed) {
-    Copy-Item -LiteralPath $Ini -Destination ($Ini + '.ngb.bak') -Force
+    # Keep the *first* backup: a second add/remove must not overwrite the
+    # pristine sider.ini with an already-modified one.
+    if (-not (Test-Path -LiteralPath ($Ini + '.ngb.bak'))) {
+        Copy-Item -LiteralPath $Ini -Destination ($Ini + '.ngb.bak')
+        Write-Host "  sider.ini : backup written to sider.ini.ngb.bak"
+    }
     [IO.File]::WriteAllLines($Ini, $lines, (New-Object System.Text.UTF8Encoding($false)))
 }
 exit 0
