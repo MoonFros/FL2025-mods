@@ -1,37 +1,44 @@
 # Next-Gen Football Broadcast Presentation
 
 **MOONFROS PRESENTS** · created by **MoonFros** · for Football Life 2025 / PES 2021 (Sider 7)
+**v1.1.0** — data layer rewritten around Sider's own match library and goal hook.
 
-A broadcast presentation layer for FL25: live player spotlights, animated goal
-analysis, milestone call-outs and a full-time Man of the Match reveal, drawn over
-the game by a transparent click-through overlay.
+A broadcast presentation layer for FL25: goal cards with the real scorer, minute
+and score, half-time and full-time result cards, a slim live score bug and
+milestone call-outs, drawn over the game by a transparent click-through overlay.
 
-| Card | What it shows |
-|---|---|
-| **Goal** | player spotlight (name, number, position, minutes, G/A/shots/SOT) + shot analysis: origin, trajectory on a mini pitch, goal location, distance, angle, modelled speed, xG, milestone badge, assist credit |
-| **Shot / reaction** | the same spotlight for every non-goal shot, sized low and wide so it never covers the player's face |
-| **Milestone toast** | `OPENER` / `FIRST GOAL` / `BRACE` / `HAT-TRICK` / `4 GOALS` / `N GOALS`, plus assist sign-off |
-| **MOTM** | gold full-time reveal: rating ring, goals, assists, shots, on target, passes, pass %, touches, minutes |
-| **Style switch** | `full` → `compact` → `minimal`, live, with the in-game `[7]` key |
+| Card | What it shows | Data tier |
+|---|---|---|
+| **Goal** | scorer's shirt name, minute, score line, team colour, milestone badge, entrance animation | engine (every build) |
+| **Goal, unnamed** | when a goal reaches the scoreboard without the hook: `GOAL`, minute, score, "SCORER NOT AVAILABLE" — never a guessed player | engine |
+| **Half time / full time** | result, final score, every scorer with minute and team | engine |
+| **Score bug** | clock, score, penalty score in a shootout | engine |
+| **Milestone toast** | `OPENER` / `BRACE` / `HAT-TRICK` / `N GOALS`, counted from goals actually seen | engine |
+| **Player stat row** | shots, on target, goals, assists, minutes, rating | tier 2, after calibration |
+| **Shot / miss / save** | shot data, miss and save cards, telemetry | tier 2, after calibration |
+| **MOTM** | gold full-time reveal with the full stat block | tier 2, after calibration |
 
-Everything numeric comes from the game's own match memory. Shot speed, apex,
-hang time and xG are **modelled** from real distance/angle/attributes and are
-labelled as such in the interface (`~` prefix, "SPEED MODELLED" in the footer).
-See [README.txt](README.txt) §6 for the exact measured-vs-calculated breakdown.
+Nothing is filled with zeros. When a number is not available the card either
+omits it or says so — see [README.txt](README.txt) §6 for the exact
+measured / calibrated / modelled breakdown.
 
 ---
 
 ## Install (3 steps)
 
 1. Double-click **`install.bat`** (or drag your Sider folder onto it).
-   It finds Sider on any drive, copies `modules\` and `ngb-overlay\`, adds two
-   lines to `sider.ini` after writing `sider.ini.ngb.bak`, then builds and starts
-   the overlay.
+   It finds Sider on any drive, copies `modules\` and `ngb-overlay\`, adds three
+   lines to `sider.ini` after writing `sider.ini.ngb.bak`
+   (`luajit.ext.enabled`, `match-stats.enabled`, `lua.module`), then builds and
+   starts the overlay.
 2. Launch the game in **borderless or windowed** mode.
-3. Play. Cards appear on goals, shots, milestones and at full time.
+3. Play. You get a goal card on the first goal, and the score bug immediately.
 
-Uninstall with **`uninstall.bat`** — it removes only this mod's files and its
-`sider.ini` line.
+You never need `Start_NGB_Overlay.bat` again after the first install: the Lua
+module launches the overlay itself at game start.
+
+Uninstall with **`uninstall.bat`** — it removes only this mod's files and its own
+`sider.ini` lines.
 
 ## Hotkeys
 

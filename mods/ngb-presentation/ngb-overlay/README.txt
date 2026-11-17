@@ -22,5 +22,16 @@ The overlay is click-through, never takes focus, only draws while the game
 window is in the foreground, and follows the game window when you alt-tab,
 resize it or change resolution.
 
+You only need Start_NGB_Overlay.bat once. The Lua module starts the overlay
+itself every time the game starts (auto_launch_companion = 1), so the .bat is a
+first-time/repair tool, not a step in your routine.
+
+Nothing appears? The overlay writes NGB_Overlay.log next to the exe, and for the
+first 30 seconds after it starts it draws a small card that says either "state
+file found" or "waiting for <path>". That tells you immediately whether the exe
+is running or the Lua module is not writing state.json.
+
 Play windowed or borderless fullscreen - exclusive fullscreen cannot show
-layered windows.
+layered windows. A CPK / livecpk root cannot replace this program: livecpk swaps
+asset files, and the game's scoreboard graphics are static textures that cannot
+be animated from live match data.

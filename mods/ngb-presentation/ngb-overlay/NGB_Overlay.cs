@@ -300,12 +300,22 @@ namespace Ngbfc.Presentation
         public double PeakMph, Xg;
     }
 
+    internal sealed class ScorerState
+    {
+        public string Name = "", Side = "home", Kind = "goal";
+        public int Minute;
+    }
+
     internal sealed class HudEvent
     {
         public int Id;
         public string Kind = "";
         public double Remaining, Duration;
         public string Side = "";
+        public bool PlayerKnown;
+        public int Minute, Tally;
+        public string Result = "", Detail = "goal";
+        public List<ScorerState> Scorers = new List<ScorerState>();
 
         public string PlayerName = "", Pos = "";
         public int Shirt;
@@ -342,6 +352,10 @@ namespace Ngbfc.Presentation
         public string Credit = "", Author = "", Tagline = "";
 
         public bool Ffi, StatsRegion, PitchRegion, CameraOk, PlayerDb, OverlayVisible;
+        public bool PlayerStats;          // per-player numbers are real (validated)
+        public bool ScorerHook;           // Sider's goal hook is available
+        public string DataScore = "none"; // "sider" when the scoreboard answers
+        public List<ScorerState> Scorers = new List<ScorerState>();
         public string NamesSource = "";
         public int EventCount;
         public string Clock = "";
@@ -424,6 +438,13 @@ namespace Ngbfc.Presentation
             st.PlayerDb = B(status, "player_db", false);
             st.NamesSource = S(status, "names", "");
             st.EventCount = I(status, "events", 0);
+            var data = D(status, "data");
+            if (data != null)
+            {
+                st.PlayerStats = B(data, "player_stats", false);
+                st.ScorerHook = B(data, "scorer_hook", false);
+                st.DataScore = S(data, "scoreboard", "none");
+            }
             st.OverlayVisible = B(status, "overlay_visible", false);
 
             var match = D(root, "match");
@@ -440,6 +461,13 @@ namespace Ngbfc.Presentation
                 e.Remaining = N(ev, "remaining", 0);
                 e.Duration = N(ev, "duration", 0);
                 e.Side = S(ev, "side", "home");
+                e.PlayerKnown = B(ev, "player_known", false);
+                e.Minute = I(ev, "minute", 0);
+                e.Tally = I(ev, "tally", 0);
+                e.ScoreLine = S(ev, "score_line", "");
+                e.Detail = S(ev, "detail", "goal");
+                e.Result = S(ev, "result", "");
+                e.Scorers = ReadScorers(ev.ContainsKey("scorers") ? ev["scorers"] : null);
 
                 var p = D(ev, "player");
                 e.PlayerName = S(p, "name", "");
@@ -550,7 +578,27 @@ namespace Ngbfc.Presentation
                 }
                 st.Event = e;
             }
+            st.Scorers = ReadScorers(root.ContainsKey("scorers") ? root["scorers"] : null);
             return st;
+        }
+
+        private static List<ScorerState> ReadScorers(object node)
+        {
+            var list = new List<ScorerState>();
+            var arr = node as List<object>;
+            if (arr == null) return list;
+            for (int i = 0; i < arr.Count && list.Count < 12; i++)
+            {
+                var d = arr[i] as Dictionary<string, object>;
+                if (d == null) continue;
+                var sc = new ScorerState();
+                sc.Name = S(d, "name", "");
+                sc.Side = S(d, "side", "home");
+                sc.Minute = I(d, "minute", 0);
+                sc.Kind = S(d, "kind", "goal");
+                list.Add(sc);
+            }
+            return list;
         }
 
         private static TeamState ReadTeam(Dictionary<string, object> d)
@@ -1164,10 +1212,18 @@ namespace Ngbfc.Presentation
             bool toastOn = _toast != null &&
                 (_clock.Elapsed.TotalSeconds - _toastStart) < Math.Max(1.0, _toast.Hold);
 
+            bool startup = false;
             if (st == null && _demoPhase == 0 && !_diag && !toastOn)
             {
-                if (Visible) Hide();
-                return;
+                // Show that the overlay is alive for the first seconds after it
+                // starts, and say what it is waiting for. A silent hide here is
+                // what makes an overlay look "not installed".
+                if (_clock.Elapsed.TotalSeconds > 30.0)
+                {
+                    if (Visible) Hide();
+                    return;
+                }
+                startup = true;
             }
             if (!ComputeGameRect()) { if (Visible) Hide(); return; }
 
@@ -1208,7 +1264,7 @@ namespace Ngbfc.Presentation
                 elapsed = Math.Max(0, _clock.Elapsed.TotalSeconds - _eventFirstSeen);
             }
 
-            bool anything = ev != null || toastOn || (st != null && st.ScoreBug) || _diag;
+            bool anything = ev != null || toastOn || startup || (st != null && st.ScoreBug) || _diag;
             if (!anything)
             {
                 if (Visible) { _rt.Begin(); _rt.Present(Handle, _winX, _winY); Hide(); }
@@ -1228,10 +1284,12 @@ namespace Ngbfc.Presentation
                     case "goal": DrawGoalCard(g, ev, st, _winW, _winH, s, elapsed, remaining); break;
                     case "shot": DrawShotCard(g, ev, st, _winW, _winH, s, elapsed, remaining); break;
                     case "motm": DrawMotmCard(g, ev, st, _winW, _winH, s, elapsed, remaining); break;
+                    case "fulltime": DrawFullTimeCard(g, ev, st, _winW, _winH, s, elapsed, remaining); break;
                 }
             }
             if (toastOn && _toast != null)
                 DrawToast(g, _toast, _clock.Elapsed.TotalSeconds - _toastStart, _winW, s);
+            if (startup) DrawStartupCard(g, _winW, _winH, s);
             if (_diag) DrawDiagnostics(g, st, _winW, _winH, s);
 
             _rt.Present(Handle, _winX, _winY);
@@ -1247,9 +1305,11 @@ namespace Ngbfc.Presentation
             if (t <= 0.001) return;
             Color team = Draw.ParseColor(ev.TeamColor, Theme.Accent);
             int style = st != null ? st.Style : 0;
-            bool analysis = (st == null || st.Analysis) && style == 0;
+            bool stats = st == null || st.PlayerStats;
+            bool analysis = stats && (st == null || st.Analysis) && style == 0;
 
             if (style >= 2) { DrawMinimalBar(g, ev, st, w, h, s, t, team); return; }
+            if (!ev.PlayerKnown) { DrawGoalBare(g, ev, st, w, h, s, t, team); return; }
 
             float k = style == 1 ? 0.84f : 1f;
             float pw = (analysis ? 1180f : 760f) * s * k;
@@ -1267,7 +1327,8 @@ namespace Ngbfc.Presentation
 
             DrawKicker(g, ev, r, team, s, true);
             DrawPlayerBlock(g, ev, cx, cy + 30 * s, textW, s, team, t);
-            DrawShotCells(g, ev, cx, r.Bottom - 84 * s, analysis ? 4 : 5, s, team, t, analysis ? 128 * s : 130 * s);
+            if (stats)
+                DrawShotCells(g, ev, cx, r.Bottom - 84 * s, analysis ? 4 : 5, s, team, t, analysis ? 128 * s : 130 * s);
             DrawFooter(g, st, ev, r, s, analysis);
 
             if (analysis)
@@ -1275,6 +1336,125 @@ namespace Ngbfc.Presentation
                 var box = new RectangleF(r.Right - 34 * s - 500 * s, r.Top + 22 * s,
                                          500 * s, ph - 76 * s);
                 DrawAnalysisPanel(g, box, ev, team, s, elapsed, t);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        //  1b. GOAL card without a scorer (scoreboard-only builds)
+        //      The score, the minute and the team colour are real; nothing else
+        //      is invented to fill the space.
+        // ---------------------------------------------------------------------
+        private void DrawGoalBare(Graphics g, HudEvent ev, HudState st, int w, int h, float s,
+                                  double t, Color team)
+        {
+            int style = st != null ? st.Style : 0;
+            float k = style == 1 ? 0.86f : 1f;
+            float pw = 820f * s * k;
+            float ph = 206f * s * k;
+            float px = 56 * s;
+            float py = h - 56 * s - ph;
+            if (py < 24 * s) py = 24 * s;
+            float slide = (float)((1.0 - Ease(t)) * 44 * s);
+            var r = new RectangleF(px, py + slide, pw, ph);
+
+            Draw.GlassPanel(g, r, 10 * s, team);
+            using (var acc = new SolidBrush(team))
+            using (var white = new SolidBrush(Theme.White))
+            using (var muted = new SolidBrush(Theme.Muted))
+            {
+                string who = !string.IsNullOrEmpty(ev.TeamAbbr) ? ev.TeamAbbr : ev.Side.ToUpperInvariant();
+                Draw.Spaced(g, who, _theme.Label, acc, r.Left + 34 * s, r.Top + 24 * s, 2.4f * s);
+                Draw.Text(g, "GOAL", _theme.Big, white, r.Left + 30 * s, r.Top + 42 * s);
+
+                string min = ev.Minute > 0 ? (ev.Minute + "'") : "";
+                Draw.TextRight(g, min, _theme.Mid, acc, r.Right - 34 * s, r.Top + 34 * s);
+
+                string line = !string.IsNullOrEmpty(ev.ScoreLine) ? ev.ScoreLine : "";
+                if (line != "")
+                    Draw.TextRight(g, line, _theme.ValueBig, white, r.Right - 34 * s, r.Top + 76 * s);
+
+                string note = ev.Detail == "own_goal" ? "OWN GOAL" : "SCORER NOT AVAILABLE";
+                Draw.Spaced(g, note, _theme.Micro, muted, r.Left + 34 * s, r.Bottom - 34 * s, 1.6f * s);
+                if (st != null && !string.IsNullOrEmpty(st.Credit))
+                    Draw.Spaced(g, st.Credit, _theme.Micro, muted,
+                                r.Right - 34 * s - Draw.SpacedWidth(g, st.Credit, _theme.Micro, 1.8f * s),
+                                r.Bottom - 34 * s, 1.8f * s);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        //  1c. HALF TIME / FULL TIME - score, result, scorers
+        // ---------------------------------------------------------------------
+        private void DrawFullTimeCard(Graphics g, HudEvent ev, HudState st, int w, int h, float s,
+                                      double elapsed, double remaining)
+        {
+            double t = Anim(elapsed, remaining);
+            if (t <= 0.001) return;
+            bool ft = ev.Result != "half_time";
+            Color accent = ft ? Theme.Gold : Theme.Accent;
+            float pw = 760f * s;
+            float lines = Math.Min(ev.Scorers != null ? ev.Scorers.Count : 0, 8);
+            float ph = (216f + lines * 30f) * s;
+            float px = 56 * s;
+            float py = h * 0.5f - ph * 0.5f;
+            if (py < 24 * s) py = 24 * s;
+            float slide = (float)((1.0 - Ease(t)) * 40 * s);
+            var r = new RectangleF(px, py + slide, pw, ph);
+
+            Draw.GlassPanel(g, r, 10 * s, accent);
+            if (ft) Draw.GoldFrame(g, r, s);
+
+            string title = ft ? "FULL TIME" : "HALF TIME";
+            string line = !string.IsNullOrEmpty(ev.ScoreLine) ? ev.ScoreLine : "";
+            if (ev.ScoreLine == "" && st != null)
+                line = st.Home.Score + " - " + st.Away.Score;
+
+            using (var white = new SolidBrush(Theme.White))
+            using (var muted = new SolidBrush(Theme.Muted))
+            using (var acc = new SolidBrush(accent))
+            {
+                Draw.Spaced(g, title, _theme.Label, acc, r.Left + 34 * s, r.Top + 26 * s, 2.6f * s);
+                Draw.Text(g, line, _theme.Big, white, r.Left + 30 * s, r.Top + 52 * s);
+
+                if (st != null)
+                {
+                    string names = st.Home.Name != "" ? st.Home.Name : "HOME";
+                    string names2 = st.Away.Name != "" ? st.Away.Name : "AWAY";
+                    Draw.Spaced(g, names + "   " + names2, _theme.Micro, muted,
+                                r.Left + 34 * s, r.Top + 132 * s, 1.6f * s);
+                }
+
+                float y = r.Top + 168 * s;
+                if (ev.Scorers != null && ev.Scorers.Count > 0)
+                {
+                    for (int i = 0; i < ev.Scorers.Count && i < 8; i++)
+                    {
+                        var sc = ev.Scorers[i];
+                        string nm = string.IsNullOrEmpty(sc.Name) ? "(scorer unknown)" : sc.Name.ToUpperInvariant();
+                        string mm = sc.Minute > 0 ? sc.Minute + "'" : "";
+                        Draw.Text(g, nm, _theme.Title, white, r.Left + 34 * s, y);
+                        Draw.TextRight(g, mm, _theme.Title, muted, r.Left + 300 * s, y);
+                        string side = sc.Side == "home"
+                            ? (st != null && st.Home.Abbr != "" ? st.Home.Abbr : "H")
+                            : (st != null && st.Away.Abbr != "" ? st.Away.Abbr : "A");
+                        Draw.Text(g, side, _theme.Micro, acc, r.Left + 330 * s, y + 4 * s);
+                        y += 30 * s;
+                    }
+                }
+                else
+                {
+                    Draw.Text(g, "no goal events recorded", _theme.Title, muted, r.Left + 34 * s, y);
+                }
+
+                if (!string.IsNullOrEmpty(ev.Result) && !ft)
+                    Draw.TextRight(g, ev.Result.Replace('_', ' ').ToUpperInvariant(),
+                                   _theme.Micro, muted, r.Right - 34 * s, r.Top + 30 * s);
+                if (st != null && !string.IsNullOrEmpty(st.Credit))
+                    Draw.Spaced(g, st.Credit, _theme.Micro, muted, r.Left + 34 * s,
+                                r.Bottom - 30 * s, 1.8f * s);
+                if (st != null)
+                    Draw.TextRight(g, "CREATED BY " + st.Author, _theme.Micro, muted,
+                                   r.Right - 34 * s, r.Bottom - 30 * s);
             }
         }
 
@@ -1821,6 +2001,53 @@ namespace Ngbfc.Presentation
             }
         }
 
+        // ---------------------------------------------------------------------
+        //  Startup / "no state yet" card - proof of life + where it is looking
+        // ---------------------------------------------------------------------
+        private bool _noStateLogged;
+
+        private void DrawStartupCard(Graphics g, int w, int h, float s)
+        {
+            bool exists = false;
+            try { exists = _statePath != null && File.Exists(_statePath); } catch { }
+
+            float pw = 760f * s;
+            float ph = 150f * s;
+            var r = new RectangleF(56 * s, h - 56 * s - ph, pw, ph);
+
+            Draw.GlassPanel(g, r, 10 * s, Theme.Accent);
+
+            using (var acc = new SolidBrush(Theme.Accent))
+            using (var white = new SolidBrush(Theme.White))
+            using (var muted = new SolidBrush(Theme.Muted))
+            {
+                Draw.Spaced(g, "MOONFROS PRESENTS", _theme.Micro, acc, r.Left + 30 * s, r.Top + 22 * s, 2.0f * s);
+                Draw.Text(g, "NGB OVERLAY " + Program.VERSION, _theme.Mid, white, r.Left + 26 * s, r.Top + 44 * s);
+
+                string line = exists
+                    ? "state file found - waiting for the game to report"
+                    : "waiting for " + ShortPath(_statePath);
+                Draw.Text(g, line, _theme.Title, muted, r.Left + 28 * s, r.Top + 86 * s);
+
+                Draw.Spaced(g, "run FL25 in BORDERLESS / WINDOWED   ·   F11 DIAGNOSTICS   ·   F12 QUIT",
+                            _theme.Micro, muted, r.Left + 28 * s, r.Bottom - 32 * s, 1.4f * s);
+            }
+
+            if (!exists && !_noStateLogged)
+            {
+                _noStateLogged = true;
+                Log("no state file yet at " + (_statePath ?? "(null)") +
+                    " - start the game; the Sider module writes it");
+            }
+        }
+
+        private static string ShortPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return "state.json";
+            if (path.Length <= 62) return path;
+            return "..." + path.Substring(path.Length - 59);
+        }
+
         private void DrawDiagnostics(Graphics g, HudState st, int w, int h, float s)
         {
             float pw = 560 * s, ph = 330 * s;
@@ -2040,6 +2267,8 @@ namespace Ngbfc.Presentation
     internal static class Program
     {
         [STAThread]
+        public const string VERSION = "1.1.0";
+
         private static void Main(string[] args)
         {
             try { Native.SetProcessDPIAware(); } catch { }

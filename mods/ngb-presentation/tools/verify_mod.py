@@ -107,6 +107,16 @@ def lua_static_checks():
     check("lua: minutes tracking", "minutes_for" in src and "minutes_exact" in src)
     check("lua: assist attribution", "assist_side" in src)
     check("lua: toast channel", "set_toast" in src)
+    check("lua: reads Sider's match library", "match.stats()" in src or "match.stats" in src)
+    check("lua: goal hook wired", "on_goal_scored" in src and "player_name_on_shirt" in src)
+    check("lua: scoreboard fallback", "watch_scoreboard" in src and "goal_fallback" in src)
+    check("lua: half/full time cards", "show_result" in src and "half_time" in src)
+    check("lua: data source reported in state", "data_source" in src and "player_stats" in src)
+    check("lua: player stats gated + validated",
+          "experimental_player_stats" in src and "validate_stats" in src
+          and "player_stats_ok" in src)
+    check("lua: ini self-check (match-stats)", "check_ini_flags" in src and "match%-stats" in src)
+    check("lua: calibration probe", "probe_write" in src and "probe.txt" in src)
     check("lua: creates its state folder defensively",
           "ensure_dir" in src and "make_dirs" in src and "create_directory" in src)
     check("lua: presentation styles", "cycle_style" in src and "STYLE_NAMES" in src)
@@ -248,6 +258,12 @@ def cs_checks():
     check("cs: overlay hotkeys avoid F7/F8/F9",
           all(k not in src for k in ("Keys.F7", "Keys.F8", "Keys.F9")))
     check("cs: minute display", "MinutesRaw" in src)
+    check("cs: full-time card", "DrawFullTimeCard" in src and "HALF TIME" in src)
+    check("cs: goal card without a scorer", "DrawGoalBare" in src and "SCORER NOT AVAILABLE" in src)
+    check("cs: player stats gate", "PlayerStats" in src and "bool stats = st == null || st.PlayerStats" in src)
+    check("cs: startup / no-state card", "DrawStartupCard" in src and "waiting for" in src)
+    check("cs: version const", "public const string VERSION" in src)
+    check("cs: reads the data block", "\"player_stats\"" in src and "scorer_hook" in src)
     check("cs: no external nuget deps",
           not re.search(r"using\s+Newtonsoft", src))
 
@@ -486,6 +502,7 @@ def packaging_checks():
         t in low for t in ("del /s", "del /q", "rd /s", "format ", "deltree")))
     check("install: builds + starts the overlay", "start_ngb_overlay.bat" in low)
     check("install: writes a log", "install_log.txt" in low)
+    check("install: mentions match-stats in the manual fallback", "match-stats.enabled" in low)
     check("install: creates the runtime state folder",
           re.search(r"content\\ngb-presentation", src) is not None
           and "mkdir" in low)
@@ -496,6 +513,7 @@ def packaging_checks():
     check("install: ini editor present", os.path.exists(ps1))
     check("ini editor: registers the module", "lua.module" in ps and "NGB_Presentation.lua" in ps)
     check("ini editor: enables luajit extensions", "luajit.ext.enabled" in ps)
+    check("ini editor: enables match stats", "match-stats.enabled" in ps)
     check("ini editor: backs the file up", ".ngb.bak" in ps)
     check("ini editor: inserts next to other modules", "lua.module" in ps and "Insert" in ps)
     check("ini editor: can remove the entry", "remove" in ps)

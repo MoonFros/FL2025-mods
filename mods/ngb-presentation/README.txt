@@ -2,48 +2,50 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.0.1
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.1.0
 ================================================================================
 
-A broadcast presentation layer for Football Life 2025: live player spotlights,
-animated goal analysis, milestone call-outs and a full-time Man of the Match
-reveal, drawn over the game by a transparent click-through overlay.
+A broadcast presentation layer for Football Life 2025: goal cards with the real
+scorer and minute, half-time and full-time score cards, a slim live score bug
+and milestone call-outs, drawn over the game by a transparent click-through
+overlay.
 
-Reads only data the game already keeps in memory - it never invents a number.
+Everything on screen comes from Sider's own match library and goal hook, which
+read the game directly. Nothing is guessed, and nothing is filled with zeros.
+
+1.1.0 is a rewrite of the data layer: the previous version tried to find the
+per-player statistics table by scanning memory with guessed offsets, which
+produced the famous "0 shots, 0 minutes, id #0" cards on builds where those
+offsets were wrong. That is gone. See section 6 for exactly what is measured,
+what is modelled and what is switched off until it is calibrated.
 
 
 --------------------------------------------------------------------------------
- 1. WHAT YOU GET
+ 1. WHAT YOU GET  (and what needs calibrating)
 --------------------------------------------------------------------------------
 
-GOAL PRESENTATION
-  * Player spotlight: name, shirt number, team, position, minutes played,
-    goals, assists, shots, shots on target.
-  * Shot analysis: original shot position, trajectory from that position to the
-    goal, goal location, distance, angle, modelled speed and xG.
-  * Milestone badge on the card: OPENER / FIRST GOAL / BRACE / HAT-TRICK /
-    4 GOALS / N GOALS.
-  * Assist credit as a separate toast when the game records one.
+WORKS OUT OF THE BOX - scoreboard data, correct on every build
+  * GOAL card: the scorer's name as the game prints it on the shirt, the
+    minute from the match clock, the running score, the team colour, a
+    milestone badge (OPENER / BRACE / HAT-TRICK / 4 GOALS / N GOALS...) and the
+    entrance animation.
+  * Unnamed goal card: if a goal reaches the scoreboard without the hook firing
+    you still get a clean card with the minute and the score - never a fake
+    player.
+  * HALF TIME and FULL TIME cards: result, score line and every goal of the
+    match with its scorer and minute.
+  * LIVE SCORE BUG: clock, score and (in a shootout) the penalty score.
+  * MILESTONE toasts, three presentation styles, 720p to 4K scaling.
 
-SHOT / REACTION PRESENTATION
-  * Every shot that is not a goal (on target, off target, blocked, saved) pops
-    the shooter's live match totals, sized to sit low and wide so it never
-    covers the player's face in the reaction cam.
-
-LIVE PERFORMANCE TRACKER
-  * One player-statistics model feeds every card, so the numbers are identical
-    everywhere and update the moment the game records an event.
-
-MAN OF THE MATCH REVEAL
-  * Full-time card with a gold treatment, rating ring, and goals, assists,
-    shots, on target, passes, pass %, touches and minutes.
-
-MILESTONES
-  * Brace, hat-trick and bigger hauls get a badge on the card and a short toast;
-    assists get their own toast sign-off.
-
-Three presentation styles (full / compact / minimal) so you can dial the amount
-of graphics up or down without touching a file.
+NEEDS CALIBRATION - the per-player table (see section 6)
+  * shots / shots on target / passes / rating per player
+  * miss, save and blocked-shot reaction cards
+  * shot analysis: trajectory, distance, angle, speed, xG
+  * assists, per-player minutes, Man of the Match
+  These need the game's per-player statistics table. Its location depends on
+  your exact FL_2025.exe build, so it ships switched off (it would otherwise
+  print zeros). The probe tool in section 6 collects what is needed to pin it
+  down; once it validates, all of it switches on by itself.
 
 NO IMAGE ASSETS: every card, pitch diagram, badge and animation is drawn
 procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
@@ -56,7 +58,10 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
 
   * Football Life 2025 (FL_2025.exe) or PES 2021, with Sider 7
   * luajit.ext.enabled = 1 in sider.ini  -  install.bat adds it for you.
-    (Without it Sider hides its memory library and live stats are impossible.)
+    (Without it Sider hides its memory library and the per-player extras.)
+  * match-stats.enabled = 1 in sider.ini  -  install.bat adds this too.
+    Sider's match library is what reports the live score and clock; without the
+    line the mod can only see goals from its hook, with no score and no minute.
   * Windows 10 or 11, 64-bit. Nothing else to download: the overlay is compiled
     on your PC by the C# compiler that ships with .NET Framework 4.x.
   * Play WINDOWED or BORDERLESS fullscreen. Exclusive fullscreen cannot show any
@@ -77,10 +82,11 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
 
         - copies modules\NGB_Presentation.lua and .ini into <Sider>\modules\
         - copies ngb-overlay\ into <Sider>\ngb-overlay\
-        - adds these two lines to sider.ini, next to your other lua.modules,
+        - adds these three lines to sider.ini, next to your other lua.modules,
           after writing a backup (sider.ini.ngb.bak):
 
               luajit.ext.enabled = 1
+              match-stats.enabled = 1
               lua.module = "NGB_Presentation.lua"
 
         - compiles and starts the overlay, then shows a confirmation.
@@ -92,8 +98,12 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
   3. Start the game. That's it.
 
   Manual install (if you ever need it): copy the two folders into your Sider
-  folder, add the two lines above to sider.ini, then run
+  folder, add the three lines above to sider.ini, then run
   ngb-overlay\Start_NGB_Overlay.bat once.
+
+  The .bat is only a launcher: it compiles NGB_Overlay.exe the first time and
+  starts it. After that the Lua module starts the overlay itself whenever the
+  game starts (auto_launch_companion = 1), so you never need the .bat again.
 
 
 --------------------------------------------------------------------------------
@@ -151,75 +161,111 @@ OVERLAY WINDOW (only when you want to check it):
 
 
 --------------------------------------------------------------------------------
- 6. WHAT IS REAL DATA AND WHAT IS CALCULATED  (please read)
+ 6. WHERE THE NUMBERS COME FROM  (please read)
 --------------------------------------------------------------------------------
 
-REAL, read from the game:
-  * player names, shirt numbers, registered position, height, kicking power
-    (from Player.bin)
-  * teams, abbreviations, kit colours, score, clock, period, match stage
-  * goals, own goals, assists, shots, shots on target, passes, pass %, tackles,
-    dribbles, touches, saves, interceptions, clearances, cards, the engine's own
-    match rating
-  * the 22 live player positions on the pitch
-  * the shot's starting position, therefore the real shot distance and the real
-    angle the goal subtends from that position
+TIER 1 - always on, correct on every build
+  Sider's match library (match-stats.enabled = 1) reports the score, the clock,
+  the period, the added minutes and the penalty score. Sider's goal hook fires
+  the moment a goal is scored and hands over the scorer's name, his id and which
+  team scored. Both are read out of the game by Sider itself, so they cannot be
+  "slightly off": either the line is in sider.ini and the numbers arrive, or the
+  mod says so in the Sider overlay (press the overlay key) and in sider.log.
 
-CALCULATED from that real data - and labelled as modelled in the interface:
-  * shot speed ("~" prefix in the card, "SPEED MODELLED" in the card footer):
-    derived from the shooter's real kicking-power attribute and the real
-    distance. Football Life does not expose a measured ball speed, so this is an
-    estimate, never presented as a measurement.
-  * apex height, hang time and the elevation angle: ballistic solution that
-    actually reaches the recorded goal-face target.
-  * xG: a logistic model of real distance and real angle.
-  * minutes played: the game keeps no per-player minutes counter, so the mod
-    records the match minute at which each player was first seen on the pitch.
-    Starters are exact; a substitute's figure is marked with "~".
+  Everything in section 1 under "works out of the box" is this tier: goal cards
+  with the real scorer and minute, the score line, half time, full time, the
+  score bug, milestone counts (the mod counts the goals it saw, so a brace and a
+  hat-trick are real counts).
 
-Anything the game does not provide is either omitted or clearly marked. No
-statistic is random and nothing is presented as a measurement when it is not.
+TIER 2 - the per-player statistics table, off until calibrated
+  Shots, shots on target, passes, ratings, assists and the engine's minutes live
+  in a per-player table inside the game's memory. Its location is specific to
+  the exact FL_2025.exe build. The previous version guessed it, which is where
+  the "0 shots, 0 min, id #0" cards came from. 1.1.0 does not guess:
+
+    * experimental_player_stats = 0 by default.
+    * When you set it to 1, the mod reads its candidate table and validates it
+      against the scoreboard: 22 readable players, shots >= shots on target, and
+      a goal total that covers the score. Only a table that passes is used.
+    * probe_enabled = 1 writes content\ngb-presentation\probe.txt with the
+      scoreboard values, a hexdump of the scoreboard block and a map of the
+      game's memory regions - the data needed to pin the table down for a new
+      build.
+
+TIER 3 - modelled, never presented as measured
+  Shot speed, apex, hang time, elevation and xG are computed from real distance,
+  real angle and the shooter's real kicking-power attribute. They appear with a
+  "~" prefix and "MODELLED" in the card footer. Football Life exposes no measured
+  ball speed, so no measured ball speed is claimed.
+
+Any statistic the game does not provide is omitted or marked. Nothing is random,
+and nothing is filled with zeros to look complete.
 
 
 --------------------------------------------------------------------------------
  7. LIMITATIONS
 --------------------------------------------------------------------------------
 
-  * No player portraits: FL25 does not expose face textures to Lua. The mod uses
-    the game's own close-up and keeps its card low and wide instead.
-  * Shot trajectory is drawn from the shooter's real position to the recorded
-    goal-face target, not from raw ball physics every frame. Where the shooter's
-    position was not available the card says the origin is estimated.
-  * The replay camera is moved by gently patching the game's own replay camera
-    constants during goal replays; exact baseline values are restored afterwards.
-    If a future game build moves those constants, the mod detects it and leaves
-    the camera untouched instead of guessing.
-  * Player close-up detection is not exposed, so the shot/reaction card is timed
-    from the shot event itself (a few seconds), which is when broadcasters show
-    the reaction.
-  * Exclusive fullscreen cannot show overlays.
+  * Per-player numbers (section 6, tier 2) need calibration on your build. Until
+    then the goal cards show the scorer, minute and score and no stat row at all.
+  * No miss / save / blocked-shot cards without tier 2: without the shots
+    counter there is nothing to detect them from. They appear once the table is
+    calibrated.
+  * No player portraits: FL25 does not expose face textures to Lua. The overlay
+    uses the game's own close-up and keeps its card low and wide instead.
+  * Video quality: an overlay can draw over the game, it cannot re-render the
+    game. Broadcast-style replays with new camera work need the game's replay
+    system, not a CPK.
+  * A CPK root (livecpk) cannot do any of this: livecpk swaps asset files -
+    textures, models, .bin data. The game's scoreboards are static textures and
+    cannot be animated from live data. Every animated live graphic in this mod
+    comes from the overlay process, which is why it exists.
+  * Exclusive fullscreen cannot show overlays. Use borderless or windowed.
+  * The replay camera is moved by patching the game's own replay camera
+    constants during goal replays. If a future build moves them, the mod detects
+    it and leaves the camera alone instead of guessing.
 
 
 --------------------------------------------------------------------------------
  8. TROUBLESHOOTING
 --------------------------------------------------------------------------------
 
-  Nothing appears at all
-    - Is lua.module = "NGB_Presentation.lua" in sider.ini?
-    - Open sider.log and search for "[NGB]". You should see the banner, then
-      "state file: ...", then "ready".
+  Nothing appears in the game
+    - Check <Sider>\ngb-overlay\overlay_log.txt first. It records when the
+      overlay started, which state.json it is watching and whether it found it.
+    - Start the overlay once by hand: ngb-overlay\Start_NGB_Overlay.bat. For the
+      first 30 seconds it draws a small card that says either "state file found"
+      or "waiting for <path>" - if you see that card, the overlay works and the
+      problem is the state file; if you see nothing, the exe is not running.
+    - The Lua module starts the overlay at game start (auto_launch_companion),
+      so after the first install you should never need the .bat again.
+    - Borderless / windowed only. In exclusive fullscreen a layered window is
+      simply not composited and nothing can appear.
+
+  Cards appear but the score and clock are 0
+    - match-stats.enabled = 1 is missing from sider.ini. The mod says so in the
+      Sider overlay ("ENGINE OFF -> add match-stats.enabled = 1") and in
+      sider.log. Add the line, restart the game.
+
+  A goal shows the team but no player name
+    - The goal hook did not fire for that goal (the scoreboard reported it
+      instead). The card is deliberately unnamed rather than guessing.
+    - If it happens for every goal, check that luajit.ext.enabled = 1 is in
+      sider.ini and that you are on Sider 7.3 or newer.
+
+  Shots / assists / ratings show nothing
+    - That is tier 2 (section 6): the per-player table is not calibrated for
+      your exe build. Set experimental_player_stats = 1 and probe_enabled = 1 in
+      NGB_Presentation.ini, play until a goal, then look at
+      content\ngb-presentation\probe.txt. Until the table validates, the cards
+      stay clean instead of printing zeros.
 
   "WARNING: LuaJIT FFI is off" in sider.log
     - Add luajit.ext.enabled = 1 to sider.ini (install.bat does this).
 
-  "stat region not found" in the F11 diagnostics
-    - The scan runs up to three times at kick-off; wait for a match.
-    - Set debug_log = 1 and look for "[NGB] stats region @ 0x..." in sider.log.
-    - Worst case, paste the address into stats_region_base in the .ini.
-
   Player names show as "PLAYER 11"
-    - Player.bin had not loaded yet (only in the first seconds after launch),
-      or your build keeps it somewhere else - check debug_log output.
+    - Only affects the tier-2 paths. Player.bin had not loaded yet (first
+      seconds after launch) or your build keeps it elsewhere - see debug_log.
 
   Overlay invisible while the game runs
     - Use borderless / windowed.
@@ -270,6 +316,18 @@ statistic is random and nothing is presented as a measurement when it is not.
 --------------------------------------------------------------------------------
 11. CHANGES
 --------------------------------------------------------------------------------
+
+  1.1.0  Data layer rewritten around Sider's own match library and goal hook.
+         - goals, scorer name, minute, score, half time, full time and the score
+           bug now work on any build, with no memory offsets involved
+         - installer adds match-stats.enabled = 1 as well
+         - the per-player scan is off by default and only publishes numbers
+           after it validates against the scoreboard, so the "0 shots / id #0"
+           cards are gone
+         - probe.txt for calibrating the per-player table on a new exe build
+         - the overlay draws a startup card and writes overlay_log.txt, so a
+           missing state file is visible instead of a blank screen
+         - score bug on by default (instant proof that the overlay is alive)
 
   1.0.1  First build compiled on Windows:
          - fixed  NGB_Overlay.cs: TextRenderingHint needed
