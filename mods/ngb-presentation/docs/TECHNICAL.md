@@ -44,7 +44,7 @@ has everything; the module only gets the table above.
 | Sider calls each handler through `lua_pcall` and only logs `lua ERROR from module_X:` | a bug in this module cannot crash the game; it prints one line and that handler call is skipped |
 | `memory.read(addr, n)` is `ffi.string(addr, n)` in Sider's own `memory.lua` — a **raw dereference with no page check** | this is the one call that can kill the game, and there is no `pcall` to catch it. It is therefore used only when the user sets `allow_unsafe_memory_reads = 1`. The default backend is the renderer DLL (`NGB_Read` = `ReadProcessMemory` on our own process, `NGB_Query` = `VirtualQuery`), neither of which can fault. With no DLL there is no safe reader, so reads stay off and the HUD says so. |
 | `ffi` only exists with `luajit.ext.enabled = 1` | the module degrades to "no live stats" and logs why (`memory lib = false  <-- READS DISABLED`) |
-| `ffi.cdef` is global to the LuaJIT state | the only declarations are the seven Win32 loader/identity calls below, declared once behind `ffi.NGB_loader_cdefs` (idempotent across Sider hot-reloads) |
+| `ffi.cdef` is global to the LuaJIT state | the only declarations are the four Win32 loader/identity calls below, declared once behind `ffi.NGB_loader_cdefs` (idempotent across Sider hot-reloads) |
 | `os` has no `remove`/`rename`/`getenv`/`exit` | nothing can delete, move or spawn anything; files are only written through `fs` (see also: a Windows `os.rename` cannot overwrite, which is the second reason the module never uses it) |
 
 ### 1.0 Why an access violation was possible at all
@@ -60,13 +60,17 @@ The complete FFI surface remaining in the Lua module:
 
 ```c
 void *LoadLibraryA(const char *name);
-int   FreeLibrary(void *handle);
 void *GetProcAddress(void *handle, const char *name);
-unsigned int SetErrorMode(unsigned int mode);
 unsigned int GetCurrentProcessId(void);
 unsigned int GetModuleFileNameA(void *mod, char *buf, unsigned int size);
-void *GetCurrentProcess(void);
 ```
+
+Four, not seven: `FreeLibrary`, `SetErrorMode` and `GetCurrentProcess` were
+declared but never called, and every declaration is a chance to collide with
+another mod sharing the same `cdef` namespace (`DWORD` vs `unsigned long`,
+`FARPROC` vs `void *`). A collision raises inside `cdef`, and a raise at load
+means Sider skips the module — the "it does not appear in the overlay" symptom.
+`verify_mod.py` checks that every declared symbol is actually used.
 
 Nothing else in the Lua module. The old `NGB_ReadProcessMemory` /
 `NGB_VirtualQuery` / `NGB_VirtualProtect` / `NGB_WinExec` / `NGB_GetTickCount64`

@@ -304,7 +304,13 @@ and nothing is filled with zeros to look complete.
  8. TROUBLESHOOTING
 --------------------------------------------------------------------------------
 
-  WHY NOTHING SHOWS  (check in this order)
+  WHY NOTHING SHOWS
+
+  FASTEST ANSWER: run NGB_Doctor.bat (double-click it). It checks the folder,
+  the three sider.ini lines, the DLL and its architecture, the logs, and the
+  files the mod writes while the game runs, then prints which one is wrong and
+  writes ngb_doctor.txt. It changes nothing. The list below is the same thing
+  by hand.
 
     0. PRESS F8 FIRST.
        A card stamped "DEMO - NOT REAL DATA" appears

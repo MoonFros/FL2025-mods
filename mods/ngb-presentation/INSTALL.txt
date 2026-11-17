@@ -84,7 +84,10 @@ version of this mod. Ignore it.
         - copy modules\NGB_Presentation.lua and modules\NGB_Presentation.ini,
         - copy ngb-render\NGB_Render.dll,
         - add three lines to sider.ini (see step 4),
-        - tell you INSTALLATION COMPLETE.
+        - tell you INSTALLATION COMPLETE, and then wait for a key press so
+          you can actually read it. (If your window still closes by itself,
+          look in install_log.txt instead - every step is written there with
+          the word "step", so you can see exactly how far it got.)
 
   3d. If the window says it could NOT find your Sider folder, do this instead:
         drag your Sider folder with the mouse and drop it ONTO install.bat.
