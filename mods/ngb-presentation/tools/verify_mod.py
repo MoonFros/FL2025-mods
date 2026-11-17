@@ -759,6 +759,32 @@ def packaging_checks():
         check("docs: README.txt separates measured and modelled data",
               "MODELLED" in doc.upper() and "REAL" in doc.upper())
         check("docs: README.txt credits MoonFros", "MoonFros" in doc)
+        # 2.0 documentation
+        check("docs: CHANGELOG covers the ten problems",
+              os.path.exists(os.path.join(ROOT, "CHANGELOG.md")))
+        chg = read(os.path.join(ROOT, "CHANGELOG.md")) if os.path.exists(
+            os.path.join(ROOT, "CHANGELOG.md")) else ""
+        check("docs: CHANGELOG marks unverified work honestly",
+              "UNVERIFIED" in chg)
+        check("docs: CHANGELOG names all ten problems",
+              all(("## %d." % i) in chg for i in range(1, 11)),
+              ", ".join(str(i) for i in range(1, 11) if ("## %d." % i) not in chg))
+        check("docs: README has the WHY-NOTHING-SHOWS checklist",
+              "WHY NOTHING SHOWS" in doc.upper())
+        check("docs: README documents the renderer hotkeys",
+              all(k in doc for k in ("F8", "F7", "F12")))
+        check("docs: README explains the self-test card",
+              "DEMO - NOT REAL DATA" in doc or "DEMO-" in doc)
+        check("docs: README documents renderer/dll_enabled",
+              "dll_enabled" in doc and "renderer" in doc.lower())
+        tech = read(os.path.join(ROOT, "docs", "TECHNICAL.md"))
+        check("docs: TECHNICAL documents the DLL hook",
+              "IDXGISwapChain::Present" in tech and "MinHook" in tech)
+        check("docs: TECHNICAL documents the SEH safety rule",
+              "__try" in tech and "SEH" in tech)
+        check("docs: TECHNICAL no longer claims ReadProcessMemory",
+              "the mod reads through **`ReadProcessMemory`**" not in tech)
+
     check("docs: technical reference present",
           os.path.exists(os.path.join(ROOT, "docs", "TECHNICAL.md")))
     check("docs: mod README present", os.path.exists(os.path.join(ROOT, "README.md")))

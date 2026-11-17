@@ -512,6 +512,10 @@ check("overlay text respects units", string.find(text, "km/h", 1, true) ~= nil
       or string.find(text, "SHOTS", 1, true) ~= nil, "metric default")
 check("overlay text carries the brand", string.find(text, "MOONFROS PRESENTS", 1, true) ~= nil)
 check("overlay text shows the active state", string.find(text, "PRESENTATION", 1, true) ~= nil)
+check("overlay text carries the diagnostics panel",
+      type(text) == "string" and string.find(text, "RENDERER", 1, true) ~= nil
+      and string.find(text, "EVENTS", 1, true) ~= nil
+      and string.find(text, "STATE", 1, true) ~= nil)
 check("overlay text lists the hotkeys", string.find(text, "[7]", 1, true) ~= nil
       and string.find(text, "[8]", 1, true) ~= nil and string.find(text, "[9]", 1, true) ~= nil)
 

@@ -3261,6 +3261,56 @@ function m.overlay_text()
         out[#out + 1] = "idle - waiting for a shot, goal or full time"
     end
 
+    -- ---- diagnostics panel (the in-game answer to "why is nothing showing?")
+    -- Everything here is observed, never assumed: tick source, renderer state,
+    -- state file age, back buffer and the first-fire count of each event.
+    do
+        local rs = m.renderer_status()
+        local rtxt = m.renderer.state or "unknown"
+        if m.renderer.state == "dll" then
+            if rs and rs.hooks == "1" then
+                rtxt = "DLL  hooks " .. tostring(rs.frames or "0") .. " frames"
+            elseif rs then
+                rtxt = "DLL loaded, NOT hooked"
+            end
+        end
+        local detail = m.renderer_detail or m.renderer.detail or ""
+        out[#out + 1] = string.format("RENDERER  %s   ticks %d via %s",
+            rtxt, m.ev_stat.tick or 0,
+            (m.ev_stat.ticks_from ~= "" and m.ev_stat.ticks_from) or "nothing")
+        if detail ~= "" and m.renderer.state ~= "dll" then
+            out[#out + 1] = "          " .. tostring(detail)
+        end
+
+        local written = m.state.last_write or 0
+        local age = (written > 0) and (now_ms() - written) or -1
+        out[#out + 1] = string.format("STATE     %s   age %s   writes %d ok / %d failed",
+            tostring(m.state.path or "none"),
+            (age >= 0 and (tostring(age) .. " ms")) or "never",
+            m.state.writes_ok or 0, m.state.writes_failed or 0)
+
+        -- first fire of each registered event: the only honest proof that
+        -- ctx.register() worked (it cannot report failure)
+        local parts = {}
+        for _, n in ipairs({ "display_frame", "overlay_on", "key_down", "set_teams",
+                             "set_match_settings", "goal_scored", "context_reset",
+                             "livecpk_data_ready" }) do
+            local e = m.events and m.events[n]
+            if e then
+                parts[#parts + 1] = string.format("%s:%d", n, e.fired or 0)
+            end
+        end
+        out[#out + 1] = "EVENTS    " .. table.concat(parts, " ")
+        if (m.ev_stat.last_error or "") ~= "" then
+            out[#out + 1] = "LAST ERR  " .. tostring(m.ev_stat.last_error)
+        end
+        local rep = m.read_render_report and m.read_render_report()
+        if rep and rep.backbuffer then
+            out[#out + 1] = string.format("BACKBUF   %s   hwnd %s",
+                rep.backbuffer, rep.hwnd or "?")
+        end
+    end
+
     if m.toast then out[#out + 1] = "> " .. m.toast.text end
 
     out[#out + 1] = "KEYS  [7] style   [8] presentation   [9] shot analysis"

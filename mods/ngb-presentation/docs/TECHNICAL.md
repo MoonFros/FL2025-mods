@@ -1,18 +1,22 @@
 # Technical reference
 
-Everything the mod reads, how it derives the broadcast graphics, and how to
-re‑calibrate it for a different `FL_2025.exe` / `PES2021.exe` build.
+Everything the mod reads, how it derives the broadcast graphics, how the
+renderer hooks the game, and how to re-calibrate it for a different
+`FL_2025.exe` / `PES2021.exe` build.
 
-Target build: **`FL_2025.exe` v1.0** (SmokePatch Football Life 2025) and
-**PES 2021 v1.7.x**. Sider **7.3.4**, LuaJIT 2.1, x64.
+Target: **`FL_2025.exe`** (Football Life 2025) and **PES 2021 v1.7.x**,
+Sider 7.x, LuaJIT 2.1, x64, Direct3D 11.
+
+> 2.0 note: this document describes the current architecture. The 1.x version
+> claimed Sider 7.3.4 and a Win32/`ReadProcessMemory` based module; both are gone.
+> Section 1 says exactly what replaced them and why.
 
 ---
 
 ## 1. Sider module environment (why the code looks the way it does)
 
-Sider 7.3.4 loads `modules\*.lua` with `luaL_loadbuffer`, sets a **sandbox
-environment**, and then calls the returned table's `init(ctx)`. The sandbox
-contains only:
+Sider 7 loads `modules\*.lua` with `luaL_loadbuffer`, runs it in a **sandbox
+environment**, and calls the returned table's `init(ctx)`. The sandbox contains:
 
 ```
 assert table pairs ipairs string math tonumber tostring unpack error
@@ -22,32 +26,48 @@ log input memory fs audio match zlib
 (+ ffi and bit when luajit.ext.enabled = 1)
 ```
 
-Consequences that shape the module:
+Everything below was verified by reading Sider's `sider.cpp` and `soft/fs.lua`,
+and by running the module inside a sandbox with the same restrictions (see
+`tools/verify_mod.lua`).
 
 | Fact | Consequence in `NGB_Presentation.lua` |
 |------|--------------------------------------|
-| `pcall`, `xpcall`, `require`, `select`, `next` are **absent** | no defensive `pcall` anywhere; every read returns `nil` on failure and every call site checks |
+| `pcall`, `xpcall`, `require`, `select`, `next`, `load`, `loadstring`, `print`, `setmetatable`, `rawset/getmetatable`, `coroutine`, `debug`, `package` are **absent** | no defensive `pcall` anywhere; every read returns `nil` on failure and every call site checks. There is no `require`, so the module is one file. |
+| `os` is only `{time, clock, date}` — **no `os.rename`** | `state.json` cannot be renamed atomically. The module writes `state.json.tmp` and then copies it over `state.json` in one `io.open`+`write`, and the DLL tolerates a truncated file (it is tested: see `tests/json_test.c`). |
 | the module must **return a table with `init`** | `local m = {} ... return m` |
-| each registered callback lives in a *second* `lua_State` owned by Sider | handlers are stored as fields of `m` (`m.on_display_frame`, …) and never as local closures, so the module table can never be collected |
-| `memory.read` is a raw `ffi.string` dereference | invalid addresses would crash the game; the mod reads through **`ReadProcessMemory`**, which returns 0 instead of raising an access violation |
-| `ffi` only exists with `luajit.ext.enabled = 1` | the module degrades to "no live stats" and says so in `sider.log` |
-| `ffi.cdef` is global to the LuaJIT state | struct/typedef names are prefixed `NGB_`, Win32 entry points are declared with `__asm__` aliases, and the guard flag is stored on the shared `ffi` table so a Sider hot‑reload cannot redefine a struct |
+| handlers live in a *second* `lua_State` owned by Sider | handlers are fields of `m` (`m.on_display_frame`, …) and are looked up through `m.handler_for`, so the table cannot be collected and registration is table-driven |
+| Sider calls each handler through `lua_pcall` and only logs `lua ERROR from module_X:` | a bug in this module cannot crash the game; it prints one line and that handler call is skipped |
+| `memory.read(addr, n)` is an **in-process** read (`ffi.string`-like) | no `ReadProcessMemory`, no `VirtualQuery`, no `__asm__` aliases any more. An invalid address is now an access violation, so **every** read is bounds-checked against a region map first (`m.build_regions` / `m.in_region`) |
+| `ffi` only exists with `luajit.ext.enabled = 1` | the module degrades to "no live stats" and logs why (`memory lib = false  <-- READS DISABLED`) |
+| `ffi.cdef` is global to the LuaJIT state | the only declarations are six Win32 loader/identity calls, declared once behind `ffi.NGB_loader_cdefs` (idempotent across Sider hot-reloads) |
 
-Declarations used (all aliased, no collisions with other modules):
+The complete FFI surface, in 2.0:
 
 ```c
-typedef struct NGB_MBI { void*BaseAddress; void*AllocationBase;
-    uint32_t AllocationProtect; uint16_t PartitionId; uint64_t RegionSize;
-    uint32_t State; uint32_t Protect; uint32_t Type; } NGB_MBI;   /* 48 bytes */
-
-uint64_t NGB_GetTickCount64(void)   __asm__("GetTickCount64");
-void    *NGB_GetCurrentProcess(void) __asm__("GetCurrentProcess");
-int      NGB_ReadProcessMemory(void*, const void*, void*, size_t, size_t*)
-    __asm__("ReadProcessMemory");
-size_t   NGB_VirtualQuery(const void*, void*, size_t) __asm__("VirtualQuery");
-int      NGB_VirtualProtect(void*, size_t, uint32_t, uint32_t*)
-    __asm__("VirtualProtect");
+void *LoadLibraryA(const char *name);
+int   FreeLibrary(void *handle);
+void *GetProcAddress(void *handle, const char *name);
+unsigned int SetErrorMode(unsigned int mode);
+unsigned int GetCurrentProcessId(void);
+unsigned int GetModuleFileNameA(void *mod, char *buf, unsigned int size);
+void *GetCurrentProcess(void);
 ```
+
+Nothing else. The old `NGB_ReadProcessMemory` / `NGB_VirtualQuery` /
+`NGB_VirtualProtect` / `NGB_WinExec` / `NGB_GetTickCount64` aliases are gone,
+and `verify_mod.py` fails the build if any of them comes back.
+
+### 1.1 Timing without `GetTickCount64`
+
+`now_ms()` is `os.time() * 1000 + floor((os.clock() % 1) * 1000)`, clamped
+monotonic (`if now < last then now = last`). It is accurate enough for card
+timing (the card durations are seconds) and it cannot fail.
+
+### 1.2 Float codecs without `ffi.cast`
+
+`f32` (decode) and `f32_bytes` (encode) are pure Lua IEEE-754. They were checked
+bit-for-bit against `struct.pack('<f')` for 18 representative values (including
+denormals, ±0, 1e-40 and 3.4e38) under LuaJIT 2.1: **0 mismatches**.
 
 ---
 
@@ -175,14 +195,17 @@ A second private region (`0xF0000` bytes, header `{0, 0xEFFE0, 1}`) holds
 satisfy `|x| <= 70, |y| <= 45, -2 <= z <= 25`. Shot distance and angle are
 derived from the shooter's real position, so they inherit tier 2's gating.
 
-### Companion hand-off
+### Renderer hand-off
 
-`state.json` is the only interface between Lua and the HUD. The module starts
-`ngb-overlay\NGB_Overlay.exe` once per session (`auto_launch_companion`),
-preferring `WinExec` over FFI (instant, no console flash) and falling back to
-`io.popen('start "" ...')`. The HUD resolves `state.json` relative to its own
-folder (`..\content\ngb-presentation\state.json`, with fallbacks), so it keeps
-working whether it sits in `ngb-overlay\`, `overlay\` or the repo root.
+`state.json` is the only interface between the module and whatever draws the
+cards. In 2.0 the module does **not** start a process any more (the 1.x
+`auto_launch_companion` / `WinExec` / `io.popen` path is gone): it loads
+`ngb-render\NGB_Render.dll` into its own process with `LoadLibraryA` and calls
+`NGB_Start(state_file, log_file, dir, enabled, hotkeys...)`. Section 9b covers
+the DLL. If the DLL is missing or refuses to start, the module logs the exact
+reason and falls back to `ngb-overlay\NGB_Overlay.exe` (`renderer = overlay`),
+which resolves `state.json` relative to its own folder with the same fallbacks
+as before.
 
 ### `Player.bin` (`common\etc\pesdb\Player.bin`)
 
@@ -388,44 +411,64 @@ The companion itself registers only `F10` (demo), `F11` (diagnostics) and `F12`
 
 ## 5c. Installer / uninstaller
 
-`install.bat` is self-contained (no dependencies beyond Windows):
+`install.bat` is self-contained (no dependencies beyond Windows, **no
+compiler**):
 
 1. **Locate Sider** - `%~1` (drag & drop), `..\sider.ini`, `%HERE%\sider.ini`,
    then every drive letter against a list of common Football Life / PES install
-   paths (`Football Life 2025`, `Games\...`, `FL2025`, `Sider`,
-   `Program Files\...`, `SteamLibrary\steamapps\common\...`). If none match it
-   asks and validates the folder (`sider.ini` required, `sider.dll` reported).
-2. **Copy** `modules\NGB_Presentation.lua` + `.ini` and `ngb-overlay\`. Nothing
-   else in the Sider folder is written; `ngb-overlay\install_info.txt` records
-   where it was installed.
+   paths. If none match it asks and validates the folder (`sider.ini` required,
+   `sider.dll` reported).
+2. **Copy** `modules\NGB_Presentation.lua` + `.ini` and
+   `ngb-render\NGB_Render.dll`. The DLL ships prebuilt (x64, 325 KB); nothing is
+   compiled on the user's machine. The C# overlay is copied too, but only as an
+   optional fallback, and it is not required for anything.
 3. **Configure** `sider.ini` through `_ngb_ini.ps1` (PowerShell 5.1, present on
    every Windows 10/11): it inserts `luajit.ext.enabled = 1` (or flips a `0` to
-   `1`) and `lua.module = "NGB_Presentation.lua"` next to the existing
-   `lua.module` lines, writes `sider.ini.ngb.bak` first, and never rewrites the
-   rest of the file. If PowerShell is blocked the installer falls back to Notepad
-   + clipboard and then verifies with `findstr`.
-4. **Build + start** the overlay by calling `ngb-overlay\Start_NGB_Overlay.bat`.
-5. **Confirm** on screen and in `install_log.txt`.
+   `1`), `match-stats.enabled = 1` and `lua.module = "NGB_Presentation.lua"` next
+   to the existing `lua.module` lines, writes `sider.ini.ngb.bak` **once**
+   (never overwriting an existing backup), and never rewrites the rest of the
+   file. If PowerShell is blocked the installer falls back to Notepad + clipboard
+   and then verifies with `findstr`.
+4. **Verify** that the renderer DLL landed and say where every log file is.
+5. **Confirm** in `install_log.txt`.
 
-`uninstall.bat` asks for confirmation (`choice`), stops `NGB_Overlay.exe`,
-deletes only `modules\NGB_Presentation.*`, `ngb-overlay\` (verified by the
-presence of `NGB_Overlay.cs`) and `content\ngb-presentation\`, then removes only
-this mod's `lua.module` line from `sider.ini` (and the marker comment added with
-it). `luajit.ext.enabled = 1` is intentionally left in place: it may be shared
-with other modules and Sider offers no record of who enabled it.
-Other mods and settings are untouched.
+`uninstall.bat` asks for confirmation (`choice`), stops `NGB_Overlay.exe` if the
+fallback was running, deletes only `modules\NGB_Presentation.*`,
+`ngb-render\` (verified by the presence of `NGB_Render.dll`), `ngb-overlay\`
+(verified by `NGB_Overlay.cs`) and `content\ngb-presentation\`, then removes
+only this mod's `lua.module` line from `sider.ini` (and the marker comment added
+with it). `luajit.ext.enabled` / `match-stats.enabled` are intentionally left in
+place: they may be shared with other modules.
+`tools\test_ini.bat` runs the whole add → add-again → remove → re-add cycle
+against sample `sider.ini` files if you want to see it for yourself.
 
 ---
 
 ## 6. `state.json`
 
 Written to `content\ngb-presentation\state.json` at `state_write_hz` (10 Hz),
-about 2 KB, so a reader is never more than one tick behind. Schema version **3**.
+about 2 KB, so a reader is never more than one tick behind. Schema version **4**.
+
+Publishing is `state.json.tmp` first, then the same bytes over `state.json` in a
+single `io.open`+`write`. (`os.rename` does not exist in Sider's sandbox, so a
+true atomic replace is impossible from Lua; the reader is written to tolerate a
+truncated file instead — `tests/json_test.c` sweeps every truncation offset.)
 
 ```json
 {
-  "v": 3, "seq": 842, "ts": 918273,
-  "module": "Next-Gen Broadcast", "version": "1.3.1",
+  "v": 4, "seq": 842, "ts": 918273,
+  "module": "Next-Gen Broadcast", "version": "2.0.0",
+  "game": { "pid": 12345, "exe": "FL_2025.exe", "exe_path": "D:\\FL2025\\FL_2025.exe",
+            "pid_source": "ffi", "hwnd": "0x00120A3C", "backbuffer": "2560x1440",
+            "renderer_fps": "0", "renderer_frames": "18231", "renderer_enabled": "1" },
+  "diag": { "schema": 4, "module": "2.0.0", "lua": "Lua 5.1",
+            "luajit": "LuaJIT 2.1.0-beta3", "ffi": true, "mem_lib": true,
+            "match_lib": true, "renderer": "dll", "renderer_detail": "...NGB_Render.dll",
+            "started_at": 1200, "ticks": 18231, "tick_source": "display_frame",
+            "state_writes": 1823, "state_writes_ok": 1823, "state_writes_failed": 0,
+            "last_error": "",
+            "events": { "display_frame": { "fired": 18231, "first": 812 },
+                        "goal_scored": { "fired": 1, "first": 152300 } } },
   "hud": { "enabled": true, "master": true, "style": 0, "analysis": true,
            "units": "metric", "scorebug": true,
            "credit": "MOONFROS PRESENTS", "author": "MoonFros",
@@ -433,6 +476,7 @@ about 2 KB, so a reader is never more than one tick behind. Schema version **3**
            "toast": { "text": "HAT-TRICK  |  B. SAKA", "kind": "milestone",
                       "seq": 12, "hold": 4.5 } },
   "status": {
+    "stats_coherent": false,
     "ffi": true, "stats_region": false, "pitch_region": false,
     "camera": true, "player_db": true, "names": "Player.bin",
     "events": 17, "overlay_visible": true, "style": 0, "analysis": true,
@@ -572,89 +616,66 @@ it finds nothing and the camera is left untouched.
 
 ---
 
-## 7b. The companion: targeting, liveness, de-duplication
+## 7b. The renderer: targeting, liveness, de-duplication
 
-### Window targeting
+### Who draws what
 
-The overlay used to draw only when it could name the process (`FL_2025`,
-`FL2025`, `PES2021`) *and* that process reported a `MainWindowHandle`. Both
-conditions are outside the mod's control: a renamed exe, or a game whose main
-window is not what Win32 reports, produced a silent blank screen - including for
-F11, because every draw path hung off the same test.
+| renderer | mechanism | when it is used |
+|---|---|---|
+| `dll` (default) | `ngb-render\NGB_Render.dll`, loaded **into the game process** by the module with `LoadLibraryA`, draws in `IDXGISwapChain::Present` | always, unless it fails to load |
+| `overlay` | the C# layered click-through window | `renderer = overlay`, or automatically if the DLL is missing / refuses to start |
+| `none` | nothing is drawn; the Sider overlay text still works | `renderer = none` |
 
-Now:
+`renderer = dll` is the default because a second window structurally cannot draw
+over an exclusive-fullscreen swapchain, and because window finding (whose
+window? is it focused? is it minimised?) disappears entirely when you draw inside
+the game's own frame.
+
+### Window targeting (C# fallback only)
+
+The 1.x overlay tried a list of guessed exe names, then fell back to "the
+focused window of any other process, ≥ 640×360". Both were wrong: the guess
+failed on a renamed exe, and the fallback could attach the overlay to a browser.
+Targeting now uses facts the game itself published in `state.json`:
 
 | Order | Rule |
 |---|---|
-| 1 | a known process name with a visible main window (`KNOWN_GAMES`) |
-| 2 | the window that currently has focus, from another process, client area ≥ 640×360 |
+| 1 | the PID in `state.json` (`game.pid`, read inside the game with `GetCurrentProcessId`) |
+| 2 | the exe name in `state.json` (`game.exe`, from `GetModuleFileNameA`) |
+| 3 | a process that has `sider.dll` loaded |
+| 4 | the previously resolved window, if it still exists and is visible |
 
-Whatever is chosen is logged as `target: ...` in `NGB_Overlay.log` and shown in
-the F11 panel. Diagnostics and the start-up card do **not** need a target at all:
-when none is found they draw on the primary screen (`_screenMode`), so the
-overlay can always be seen and can always state what it is waiting for.
+If none produce a window, the overlay attaches to **nothing**. Diagnostics can
+still draw on the primary screen, so it can always be read.
+
+### Does the overlay draw when the game is not focused?
+
+Yes. The 1.x rule "the game must be the foreground window" is deleted. The only
+conditions are `IsWindowVisible` and `!IsIconic`, and the layout comes from the
+game window's client rect.
 
 ### Liveness
 
-The companion rewrites `content\ngb-presentation\overlay_alive.txt` every two
-seconds:
+Three separate heartbeat files, because a freeze has three different causes:
 
-```
-1.3.0 pid 4242 87.5
-game process FL_2025.exe
-1920x1080
-```
+| file | writer | period | proves |
+|---|---|---|---|
+| `content\ngb-presentation\state.json` | Lua module | 10 Hz | the module is reading the game and publishing it |
+| `content\ngb-presentation\heartbeat.txt` | Lua module | 1 Hz | the module is *ticking* (`ticks_from=` names the event), and how many state writes succeeded |
+| `content\ngb-presentation\render.txt` | DLL | 1 Hz | the renderer is inside a frame (`frames=`), the real `backbuffer=`, the `hwnd=`, and whether the kill switch is on |
 
-`m.watch_overlay()` reads it on a 2 s cadence, keeps `m.overlay_seen` and
-`m.overlay_info`, prints `OVERLAY running <version>` or
-`OVERLAY NOT RUNNING -> run ngb-overlay\Start_NGB_Overlay.bat` in the Sider
-overlay, and publishes `status.data.overlay_alive` in `state.json`. That turns
-"nothing appeared" into an answerable question.
+The DLL decides freshness from the **write time of `state.json`**, not from when
+it last read it: if the module stops writing, the cards disappear instead of
+freezing the last score line on screen.
 
-### One goal, one card
+### De-duplication
 
-FL25 updates the scoreboard several seconds after the celebrations, while Sider's
-`goal_scored` hook fires immediately. 1.2.0 treated "score changed but not in the
-last 3 s" as an unseen goal, so a slow scoreboard produced a second, unnamed
-scorer for the same goal.
-
-The fix is counting rather than timing:
-
-* every goal the mod announces (hook **or** tier-2 detection) increments
-  `m.eng.unconfirmed[side]` (own goals credit the other side);
-* `watch_scoreboard()` consumes those counters first - a jump it can explain is
-  the board catching up, not a new goal;
-* a jump it cannot explain becomes a *pending* fallback, shown only after
-  `goal_fallback_delay_ms` (default 2500 ms) if no hook arrives, and cancelled by
-  any hook that lands in that window.
-
-Full time is likewise observed, not assumed: the match clock stopping for 8 s at
-or past 90'/120' raises the card, instead of trusting a "clock is running" byte
-that differs between builds.
-
-### Build integrity
-
-The overlay is compiled on the player's machine by `Start_NGB_Overlay.bat`
-(`csc.exe` from .NET Framework 4.x), which is why a source-level mistake can
-ship invisibly: 1.1.0 - 1.3.0 had `[STAThread]` attached to the version constant
-instead of `Main`, so `csc` refused the file and no exe was produced at all. Every
-behavioural fix in those versions was therefore never executed.
-
-Guards now in place:
-
-| Guard | Where |
-|---|---|
-| `install.bat` exits with **INSTALL INCOMPLETE** and the compiler output when the build fails | `install.bat` |
-| the start script warns that it is launching an *older* exe, and prints when that exe was built | `Start_NGB_Overlay.bat` |
-| the exe writes its version into the heartbeat; the module compares it with its own and prints `OVERLAY STALE x.y.z` when they differ | `m.watch_overlay` / `overlay_text` |
-| the offline suite asserts that `[STAThread]` sits on `Main` and never on a field | `tools/verify_mod.py` |
-
-### Single instance
-
-`Program.Main` takes a named mutex (`MoonFros.NGB.Overlay`); a second copy logs
-and exits, so running `Start_NGB_Overlay.bat` while the module already launched
-one cannot stack two sets of cards. A state file that stops updating for 10 s is
-treated as gone, so closing the game does not leave a frozen score bug behind.
+Unchanged and still the authority chain: the `goal_scored` hook first (counts
+into `unconfirmed[side]`), the scoreboard watcher second (a jump already covered
+by a hook count is the board catching up, not a second goal), the delayed
+fallback last (`goal_fallback_delay_ms`). Own goals are re-attributed to the
+conceding side. A VAR-disallowed goal simply never reaches the scoreboard, so it
+produces no card.
 
 ---
 
@@ -684,6 +705,122 @@ The mod is an original **MoonFros** creation. `MOONFROS PRESENTS` and
 
 `tools/verify_mod.py` also asserts that the module never registers `F7` / `F8` /
 `F9` and that the three digit hotkeys are present.
+
+---
+
+## 9b. The renderer DLL (`ngb-render/`)
+
+### Why a DLL and not a window
+
+A layered, click-through window can never appear over an **exclusive fullscreen**
+swapchain: when the game owns the display, anything drawn by DWM is simply not
+composited. A second window also has to answer "which window is the game, where
+is it, is it focused, is it minimised" — three questions that produced problems
+1–3 in the first place. Drawing inside the game's own `Present` removes all four
+issues at once: the cards are part of the frame the GPU submits, so windowed,
+borderless, exclusive fullscreen, focused and unfocused are the same case.
+
+### How it is loaded
+
+The module calls `LoadLibraryA("<sider>\ngb-render\NGB_Render.dll")` and then
+`NGB_Start(config)`. There is **no loader for the user to compile**, no
+`dinput8.dll` proxy, no injection: the DLL is loaded by the game process, into
+the game process, by a module that is already running inside it. If
+`luajit.ext.enabled = 0` the module cannot call `LoadLibraryA`, and it says so.
+
+Config block (semicolon separated, copied immediately):
+
+```
+state_file=<sider>\content\ngb-presentation\state.json
+log_file=<...>\ngb-dll.log
+dir=<...>\
+enabled=1
+hotkey_selftest=0x77      (F8)
+hotkey_diag=0x76          (F7)
+hotkey_kill=0x7B          (F12)
+```
+
+### Hooking (MinHook)
+
+`IDXGISwapChain::Present` and `IDXGISwapChain::ResizeBuffers` are patched with
+**MinHook** (BSD-2, vendored under `ngb-render/minhook/`):
+
+| step | detail |
+|---|---|
+| 1 | `MH_Initialize()` |
+| 2 | create a **private, never-shown** window (`WS_EX_TOOLWINDOW \| WS_EX_NOACTIVATE`) and a dummy `D3D11CreateDeviceAndSwapChain` on it. This is the version-independent way to obtain the swapchain vtable without assuming `d3d11.dll` is already loaded, and it never touches anybody else's window. |
+| 3 | `MH_CreateHook(vtbl[8], present_hook)` — `IDXGISwapChain::Present` |
+| 4 | `MH_CreateHook(vtbl[13], resize_hook)` — `IDXGISwapChain::ResizeBuffers` |
+| 5 | `MH_EnableHook(MH_ALL_HOOKS)`, then destroy the probe window |
+
+`resize_hook` releases every size-dependent object (`RenderTargetView`, shader
+resource views, cached text) **before** calling the original, then rebuilds on
+the next `Present`. Skipping this is the classic cause of a black screen after
+alt-tab or a resolution change.
+
+### Drawing
+
+* Device and swapchain are the game's own (`swapchain->GetDevice`); nothing here
+  can change the presentation mode.
+* Every frame: capture the game's render target, depth-stencil view, shaders,
+  input layout, vertex/index/constant buffers, blend/raster/depth state,
+  sampler, viewport and topology; set ours; draw; restore all of it.
+* Quads: one vertex buffer (6 vertices per quad, written with
+  `MAP_WRITE_DISCARD`), one constant buffer carrying screen size + colour, one
+  pixel shader that multiplies the sampled texture's red channel by the colour.
+  Solid fills sample a 1×1 white texture, so there is exactly one shader pair.
+* Text: GDI renders the string white-on-black into a DIB, which is uploaded as
+  a texture and used as an alpha mask (anti-aliased, tinted by the colour).
+  Cached per (string, px, weight) with LRU eviction, 384 entries max. This gives
+  real typography without shipping a font file and without a DirectWrite
+  dependency.
+* Shaders are compiled at runtime from `d3dcompiler_47.dll` (present on Windows
+  8.1+, and shipped with the game). If it is missing the renderer logs
+  `d3dcompiler_47.dll not available` and stays off.
+* No hard-coded resolution: the layout unit is `h / 1080` from the **real back
+  buffer**, clamped to 0.45–3.0. `tests/card_test.c` asserts that no draw call
+  leaves the screen at 1280×720, 1920×1080, 2560×1440, 3440×1440, 3840×2160 and
+  1024×768, and that type scales with height.
+
+### Data
+
+`state.json` only, read on a worker thread every 100 ms
+(`CreateThread`, `CRITICAL_SECTION`). Present only ever touches the snapshot, so
+file IO never blocks the render thread. Freshness comes from the **file's write
+time**: `age >= 3000 ms` means "no data", and nothing is drawn. The DLL never
+reads game memory, so a wrong offset cannot make it crash.
+
+### Safety
+
+| risk | mitigation |
+|---|---|
+| a fault inside our code | the whole Present body is inside hardware SEH (`__try/__except`, emitted as a real scope table by clang/MSVC). On an exception: log the code, set `g_dead`, return `Present` untouched. The game never sees it. |
+| re-entrancy (our draw triggering Present) | `s_in_present` guard; the nested call goes straight to the original |
+| a bad state file | bounded reader, no allocation of parsed values, truncation-safe (tested) |
+| a stuck renderer | `F12` kill switch, and `dll_enabled = 0` skips hook installation entirely |
+| logs growing forever | capped at 8 MB, then truncated with a marker |
+| the module disappearing | cards vanish after 3 s of no new state (by design, not a freeze) |
+| touching game data | the DLL opens exactly one file for writing (`render.txt`) and one log file. It never writes a save, EDIT data or a game file. |
+
+`NGB_GetState()` returns
+`version=...;hooks=1;enabled=1;faults=0;frames=...;backbuffer=2560x1440;state_age_ms=...;state_seq=...;dead=0;log=...`
+and is folded into `state.json`'s `diag` block, the F7 strip and the diagnostics
+panel.
+
+### Building
+
+```bat
+rem no Visual Studio needed:
+ngb-render\build.sh            (zig cc -target x86_64-windows-gnu -fms-extensions)
+
+rem or, with MSVC:
+cl /LD /O2 /EHsc- /GS- src\*.c minhook\src\*.c minhook\src\hde\hde64.c ^
+   /I minhook\include /I src /link d3d11.lib dxgi.lib gdi32.lib user32.lib ole32.lib
+```
+
+`-fms-extensions` is what makes `__try/__except` available to clang; without it
+the SEH protection silently disappears, so `verify_mod.py` checks for it in both
+the source and the build command.
 
 ---
 
