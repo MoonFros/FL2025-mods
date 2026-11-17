@@ -390,8 +390,33 @@ def cs_checks():
     check("cs: startup / no-state card", "DrawStartupCard" in src and "waiting for" in src)
     check("cs: version const", "public const string VERSION" in src)
     check("cs: sample cards are labelled", "SAMPLE DATA" in src and "DrawDemoBadge" in src)
-    check("cs: focused-window fallback when the game name is unknown",
-          "focused window" in src and "KNOWN_GAMES" in src)
+    # ---- problems 1-3 are regression-tested here -------------------------
+    rect = src[src.index("private bool ComputeGameRect()"):]
+    rect = rect[:rect.index("private ")+(len(rect))]
+    check("cs: ComputeGameRect does not look at the foreground window",
+          "GetForegroundWindow" not in rect[:2000],
+          "problem 1 regression")
+    check("cs: overlay hides only when minimised / invisible",
+          "IsIconic" in rect[:2000] and "IsWindowVisible" in rect[:2000])
+    cs_code = re.sub(r"//[^\n]*", "", src)
+    cs_code = re.sub(r'/\*.*?\*/', "", cs_code, flags=re.S)
+    check("cs: no guessed exe list (problem 3)",
+          "KNOWN_GAMES" not in cs_code and "FL_2025" not in cs_code,
+          "the process name now comes from state.json")
+    check("cs: no 'focused window of another process' fallback (problem 2)",
+          "focused window of" not in cs_code)
+    check("cs: attaches by pid from state.json",
+          "WindowForPid" in src and "st.GamePid" in src)
+    check("cs: falls back to the sider.dll process",
+          "ProcessHasSider" in src and "sider.dll" in src)
+    check("cs: per-monitor DPI awareness ladder",
+          "SetProcessDpiAwarenessContext" in src and "SetProcessDpiAwareness" in src)
+    check("cs: layout from the real client rect",
+          "GetClientRect(_gameHwnd" in src and "_winH / 1080f" in src)
+    check("cs: follows the window when moved or resized",
+          "Location.X != _winX" in src)
+    check("cs: last-resort reuse of a still-valid window",
+          "previous window" in src)
     check("cs: diagnostics draw without a game window",
           "_screenMode" in src and "Screen.PrimaryScreen" in src)
     check("cs: single instance guard", "MoonFros.NGB.Overlay" in src)

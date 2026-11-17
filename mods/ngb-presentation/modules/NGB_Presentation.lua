@@ -2908,6 +2908,26 @@ local function build_state(now)
             tagline = m.TAGLINE,
             scale_hint = 1.0,
         },
+        -- problem 3: the process the renderer/C# companion must attach to.
+        -- pid/exe are read from inside the game; hwnd/backbuffer come from the
+        -- DLL renderer (the only component that sees the swapchain). Empty
+        -- strings, never guesses, when a value is unknown.
+        game = (function()
+            -- m.* lookup at call time: this block is defined before the
+            -- renderer section that supplies the reader
+            local rep = (m.read_render_report and m.read_render_report()) or {}
+            return {
+                pid = m.ident.pid or 0,
+                exe = m.ident.exe or "",
+                exe_path = m.ident.path or "",
+                pid_source = m.ident.source or "unknown",
+                hwnd = rep.hwnd or "",
+                backbuffer = rep.backbuffer or "",
+                renderer_fps = rep.fps or "",
+                renderer_frames = rep.frames or "",
+                renderer_enabled = rep.enabled or "",
+            }
+        end)(),
         -- schema v4: everything the renderer/diagnostics need to say "what is
         -- actually running". Never guessed: absent means unknown.
         diag = {
@@ -3637,10 +3657,76 @@ local function declare_loader()
         int   FreeLibrary(void *handle);
         void *GetProcAddress(void *handle, const char *name);
         unsigned int SetErrorMode(unsigned int mode);
+        unsigned int GetCurrentProcessId(void);
+        unsigned int GetModuleFileNameA(void *mod, char *buf, unsigned int size);
+        void *GetCurrentProcess(void);
     ]]
     ffi.NGB_loader_cdefs = true
     return true
 end
+
+-- ---------------------------------------------------------------------------
+-- Process identity (problem 3: the C# overlay used to *guess* exe names)
+--
+-- We are running inside the game process, so we can simply ask it. This is the
+-- only reliable answer, and it is what state.json publishes for the renderer.
+-- Every step is individually guarded: a missing ffi or a failed call leaves the
+-- field empty (rendered as "unknown") instead of aborting the module.
+-- ---------------------------------------------------------------------------
+m.ident = { pid = 0, exe = "", hwnd = "", backbuffer = "", source = "unknown" }
+
+local function read_identity()
+    local idn = m.ident
+    if idn.pid ~= 0 or not ffi_ok then return idn end
+    local ok = declare_loader()
+    if not ok then return idn end
+    -- the calls are cheap and cannot fault; still, guard each one separately so
+    -- one missing export does not cost us the other field
+    local got_pid = false
+    local f = C and C.GetCurrentProcessId
+    if f then
+        local v = f()
+        if v and v > 0 then idn.pid = tonumber(v) or 0; got_pid = idn.pid > 0 end
+    end
+    local fm = C and C.GetModuleFileNameA
+    if fm then
+        local buf = ffi.new("char[512]")
+        local n = fm(nil, buf, 512)
+        if n and n > 0 then
+            local path = ffi.string(buf, tonumber(n))
+            idn.exe = string.match(path, "([^\\/]+)$") or path
+            idn.path = path
+        end
+    end
+    idn.source = (got_pid and idn.exe ~= "") and "ffi" or (got_pid and "ffi-pid" or "unknown")
+    return idn
+end
+m.read_identity = read_identity
+
+-- The DLL renderer knows the swapchain, so it is the only component that can
+-- report the window handle and the real back-buffer size. It writes them to
+-- render.txt; we fold them into state.json so there is one file to read.
+local function render_dir(ctx)
+    local sdir = (ctx and ctx.sider_dir) or m.sider_dir or "."
+    if string.sub(sdir, -1) ~= "\\" and string.sub(sdir, -1) ~= "/" then sdir = sdir .. "\\" end
+    return sdir .. "ngb-render\\"
+end
+m.render_dir = render_dir
+
+local function read_render_report()
+    if not io or not io.open or not m.sider_dir then return nil end
+    local f = io.open(render_dir({ sider_dir = m.sider_dir }) .. "render.txt", "r")
+    if not f then return nil end
+    local out = {}
+    for line in f:lines() do
+        local k, v = string.match(line, "^%s*([%w_]+)%s*=%s*(.-)%s*$")
+        if k then out[k] = v end
+    end
+    f:close()
+    if not out.hwnd and not out.backbuffer then return nil end
+    return out
+end
+m.read_render_report = read_render_report
 
 -- LoadLibraryA helper with no FFI cdef risk: uses the raw symbol so a build
 -- whose cdef already declares LoadLibraryA (unlikely) still works.
@@ -3913,8 +3999,11 @@ m.handler_for = {
 
 function m.init(ctx)
     m.ctx = ctx
+    m.sider_dir = (ctx and ctx.sider_dir) or ""
     m.started_at = now_ms()
     log_environment(ctx)
+    -- problem 3: ask the game who it is, instead of guessing exe names later
+    read_identity()
 
     -- configuration
     local sdir = ctx and ctx.sider_dir or ""
@@ -3973,7 +4062,13 @@ function m.init(ctx)
     -- first state file so the companion can start straight away
     m.write_state(now_ms())
 
+    -- the DLL draws the cards inside the game's own frame; if it cannot load
+    -- we fall back to the C# window and say exactly why (never silently)
     m.load_renderer(ctx)
+    read_identity()
+    log_msg(string.format("game identity: pid %d  exe %s  (source %s)",
+        m.ident.pid or 0, (m.ident.exe ~= "" and m.ident.exe or "unknown"),
+        m.ident.source or "unknown"))
     log_msg("ready")
 end
 
