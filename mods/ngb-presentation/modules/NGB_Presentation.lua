@@ -58,7 +58,7 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "2.0.2"
+m.VERSION = "2.0.3"
 m.STATE_VERSION = 4
 
 -- ============================================================================
@@ -74,6 +74,11 @@ m.STATE_VERSION = 4
 --          the module has no pcall to catch it. The region map narrowed the
 --          window but could not close it - a region can be unmapped between
 --          the map being built and the read.
+--
+--   2.0.3  hook installation is a retrying plan (probe, then the game's own
+--          swapchain through the IDXGI factory), because the probe can fail at
+--          module-init time on a machine where Direct3D is not warmed up yet.
+--          See CHANGELOG problem 14.
 --
 --   2.0.2  get_proc() casts every export before calling it. 2.0.1 called the
 --          raw `void *` from GetProcAddress, which LuaJIT refuses
@@ -3377,7 +3382,8 @@ function m.overlay_text()
             if rs and rs.hooks == "1" then
                 rtxt = "DLL  hooks " .. tostring(rs.frames or "0") .. " frames"
             elseif rs then
-                rtxt = "DLL loaded, NOT hooked"
+                rtxt = "DLL loaded, NOT hooked (" .. tostring(rs.hook_plan or "?") ..
+                       " after " .. tostring(rs.hook_tries or "0") .. " tries)"
             end
         end
         local detail = m.renderer_detail or m.renderer.detail or ""
@@ -3386,6 +3392,15 @@ function m.overlay_text()
             (m.ev_stat.ticks_from ~= "" and m.ev_stat.ticks_from) or "nothing")
         if detail ~= "" and m.renderer.state ~= "dll" then
             out[#out + 1] = "          " .. tostring(detail)
+        end
+        -- "DLL loaded but not hooked" is a state, not a failure: the DLL keeps
+        -- retrying (probe first, then the game's own swapchain). Show where it
+        -- is and what Direct3D said, so the panel alone answers the question.
+        if rs and rs.hooks ~= "1" and (rs.hook_plan or "") ~= "" then
+            out[#out + 1] = string.format(
+                "          hooking: %s, %s tries, hw=%s warp=%s",
+                tostring(rs.hook_plan), tostring(rs.hook_tries or "0"),
+                tostring(rs.hr_hw or "-"), tostring(rs.hr_warp or "-"))
         end
 
         local written = m.state.last_write or 0
@@ -4060,6 +4075,8 @@ function m.load_renderer(ctx)
     m.renderer.detail = path
     log_msg("renderer: NGB_Render.dll loaded and NGB_Start() called - " ..
             "cards are drawn inside the game's own frame")
+    log_msg("renderer: if the game was not ready for Direct3D at this point, "
+            .. "the DLL hooks itself later - watch ngb-dll.log for 'hooks installed'")
     return true
 end
 

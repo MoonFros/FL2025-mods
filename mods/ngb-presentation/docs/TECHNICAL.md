@@ -802,7 +802,7 @@ return unnoticed.
 | Export | Signature | Purpose |
 |--------|-----------|---------|
 | `NGB_Start` | `int NGB_Start(const char *config)` | parse the `;`-joined config, install the hooks. Returns `1` when it hooked, `0` when it declined (already hooked, unsupported, global switch off) — the module treats `0` as "fall back". |
-| `NGB_GetState` | `const char *NGB_GetState()` | one snapshot line for the diagnostics panel: `version=…;hooked=…;frames=…;bb=WxH;state_age_ms=…;seq=…;dead=…;read=1;query=1;log=…` |
+| `NGB_GetState` | `const char *NGB_GetState()` | one snapshot line for the diagnostics panel: `version=…;hooked=…;frames=…;bb=WxH;state_age_ms=…;seq=…;dead=…;read=1;query=1;hook_plan=…;hook_tries=…;hr_hw=…;hr_warp=…;log=…` — `hook_plan` is `not-tried` / `probe-hardware` / `probe-warp` / `factory` / `hooked` / `gave-up`, and the two HRESULTs are the probe's own answers |
 | `NGB_Read` | `uint NGB_Read(uint64 addr, void *buf, uint len)` | **the module's safe reader.** `ReadProcessMemory(GetCurrentProcess(), …)`. Returns the bytes actually read: a bad address gives a short count, never a fault. Capped at 1 MiB per call. |
 | `NGB_Write` | `uint NGB_Write(uint64 addr, const void *buf, uint len)` | the matching writer (replay camera only), via `WriteProcessMemory` with an explicit `VirtualProtect` round-trip. |
 | `NGB_Query` | `uint NGB_Query(uint64 addr, uint64 *base, uint64 *size, uint *protect)` | `VirtualQuery`: fills the containing region so the module can build a real memory map instead of guessing bands. |
@@ -819,15 +819,34 @@ in your own process — which is exactly what Sider's `memory.read` is not.
 ### Hooking (MinHook)
 
 `IDXGISwapChain::Present` and `IDXGISwapChain::ResizeBuffers` are patched with
-**MinHook** (BSD-2, vendored under `ngb-render/minhook/`):
+**MinHook** (BSD-2, vendored under `ngb-render/minhook/`).
 
-| step | detail |
-|---|---|
-| 1 | `MH_Initialize()` |
-| 2 | create a **private, never-shown** window (`WS_EX_TOOLWINDOW \| WS_EX_NOACTIVATE`) and a dummy `D3D11CreateDeviceAndSwapChain` on it. This is the version-independent way to obtain the swapchain vtable without assuming `d3d11.dll` is already loaded, and it never touches anybody else's window. |
-| 3 | `MH_CreateHook(vtbl[8], present_hook)` — `IDXGISwapChain::Present` |
-| 4 | `MH_CreateHook(vtbl[13], resize_hook)` — `IDXGISwapChain::ResizeBuffers` |
-| 5 | `MH_EnableHook(MH_ALL_HOOKS)`, then destroy the probe window |
+Finding those two functions is the hard part, and 2.0.2 got it wrong by
+assuming one route was enough. There are now **two independent routes**, tried
+in order and retried in the background (`src/ngb_plan.h` holds the state names
+and the retry schedule; `tests/plan_test.c` proves both without Windows):
+
+| route | detail | why it can fail |
+|---|---|---|
+| 1. probe | a **private, never-shown** window (`WS_EX_TOOLWINDOW \| WS_EX_NOACTIVATE`) plus a dummy `D3D11CreateDeviceAndSwapChain`; `vtbl[8]` / `vtbl[13]` are read off the result and the window is destroyed again before returning. Hardware first, then WARP. | it needs Direct3D to be initialised in the process. A Sider module runs at start-up, *before* the game has created any device: on a real machine (2.0.2, pids 3232/8600) both the hardware and the WARP probe returned a failing HRESULT, so the DLL had no vtable to hook and drew nothing for the whole session. |
+| 2. factory | `IDXGIFactory::CreateSwapChain` (`vtbl[10]`) and `CreateSwapChainForHwnd` (`vtbl[11]`) of an `IDXGIFactory1` from `CreateDXGIFactory1` are hooked, and the DLL waits for the **game** to create its own swapchain. When `factory_swapchain_seen()` sees one it hooks that swapchain's `Present`/`ResizeBuffers`, then disables the create-hooks. | needs `dxgi.dll` (always present once Direct3D is nearby); needs nothing of ours, which is exactly why it survives the case that kills the probe. Factory vtables are per-module, so one instance's table covers every factory in the process — including the internal one behind `D3D11CreateDeviceAndSwapChain`. |
+
+Attempts run once inside `NGB_Start` and then on the existing poll thread while
+`hooks == 0`, with `ngb_hook_wait_ms()`: 500 ms for the first few attempts, 2 s
+up to ten, then 5 s forever. The probe budget is `NGB_PROBE_BUDGET` (6), so a
+failing probe costs nothing after the game has started.
+
+Safety rules that are not negotiable here:
+
+* `NGB_Start` **never returns 0 for "not hooked yet"** — 0 makes the Lua module
+  fall back to the C# window, which draws nothing. The state carries the truth
+  instead (`hooks=0` plus `hook_plan=`), and `verify_mod.py` fails the build if a
+  `return 0` appears anywhere in that function.
+* Before any vtable slot is patched, `in_module(dxgi.dll, slot)` must confirm the
+  address really is inside `dxgi.dll`. One wrong index hooks an arbitrary
+  function, which is a crash rather than a missing card.
+* A failed route only logs. It never retries in a spin loop (the delay is never
+  zero) and never touches the game.
 
 `resize_hook` releases every size-dependent object (`RenderTargetView`, shader
 resource views, cached text) **before** calling the original, then rebuilds on
@@ -879,7 +898,7 @@ reads game memory, so a wrong offset cannot make it crash.
 | touching game data | the DLL opens exactly one file for writing (`render.txt`) and one log file. It never writes a save, EDIT data or a game file. |
 
 `NGB_GetState()` returns
-`version=...;hooks=1;enabled=1;faults=0;frames=...;backbuffer=2560x1440;state_age_ms=...;state_seq=...;dead=0;log=...`
+`version=...;hooks=1;enabled=1;faults=0;frames=...;backbuffer=2560x1440;state_age_ms=...;state_seq=...;dead=0;read=1;query=1;hook_plan=hooked;hook_tries=1;hr_hw=0x00000000;hr_warp=0x00000000;log=...`
 and is folded into `state.json`'s `diag` block, the F7 strip and the diagnostics
 panel.
 

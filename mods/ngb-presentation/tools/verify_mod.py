@@ -1097,6 +1097,32 @@ def dll_checks(verbose=False):
           "GetForegroundWindow" not in src_code and "WS_EX_TOOLWINDOW" in src_code)
     check("dll: exports NGB_Start / NGB_GetState",
           "__declspec(dllexport) int NGB_Start" in src and "NGB_GetState" in src)
+
+    # ---- 2.0.3: hooking must not depend on the probe succeeding ----------
+    # The probe needs a warmed-up Direct3D; a Sider module runs before that, so
+    # it can fail. The factory route hooks the game's own swapchain instead.
+    plan = read(os.path.join(RENDER, "src", "ngb_plan.h"))
+    check("dll: the hook plan lives in a host-testable header",
+          "ngb_plan_name" in plan and "ngb_hook_wait_ms" in plan
+          and '#include "ngb_plan.h"' in src)
+    check("dll: the retry delay comes from the tested helper",
+          "ngb_hook_wait_ms(" in src and "s_next_hook_try = now + ngb_hook_wait_ms" in src,
+          "no inline backoff literals")
+    check("dll: factory route hooks CreateSwapChain + CreateSwapChainForHwnd",
+          "CreateSwapChainForHwnd" in src and "CreateDXGIFactory1" in src
+          and "factory_swapchain_seen" in src)
+    check("dll: a vtable slot is only hooked inside dxgi.dll",
+          "in_module(dxgi" in src and "not hooking it" in src)
+    _start = src[src.index("__declspec(dllexport) int NGB_Start"):]
+    _start = _start[:_start.index("__declspec(dllexport)", 1)]
+    check("dll: NGB_Start never reports 'not hooked' as failure",
+          "Never return 0 here" in _start and "return 0;" not in _start,
+          "0 makes the Lua module fall back to the C# window")
+    check("dll: the diagnostics say which plan is in force",
+          "hook_plan=" in src and "hook_tries=" in src
+          and "hr_hw=" in src and "hr_warp=" in src)
+    check("dll: the retry loop lives on the poll thread",
+          "hook_attempt();" in src and "s_stop_poll" in src)
     # the memory helpers must be non-faulting: ReadProcessMemory/VirtualQuery,
     # never a raw dereference of a caller-supplied address
     check("dll: memory helpers use ReadProcessMemory / VirtualQuery",
@@ -1199,11 +1225,12 @@ def dll_checks(verbose=False):
     else:
         check("dll: builds from source (zig cc)", None, "skipped (no zig)")
 
-    # ---- host unit tests: json reader + card geometry --------------------
+    # ---- host unit tests: json reader, card geometry, hook plan ----------
     if cc:
         for name, files, extra in (
                 ("json", ["tests/json_test.c", "src/ngb_json.c"], []),
-                ("card", ["tests/card_test.c", "src/ngb_card.c"], ["-lm"])):
+                ("card", ["tests/card_test.c", "src/ngb_card.c"], ["-lm"]),
+                ("plan", ["tests/plan_test.c"], [])):
             exe = os.path.join(build_dir, name + "_test")
             cmd = [cc, "-DNGB_HOST_TEST", "-I", "src", "-o", exe] + files + extra
             try:

@@ -1,7 +1,7 @@
 # Next-Gen Football Broadcast Presentation
 
 **MOONFROS PRESENTS** · created by **MoonFros** · for Football Life 2025 / PES 2021 (Sider 7)
-**v2.0.2** — the cards are drawn *inside the game's own frame* by a D3D11 renderer DLL.
+**v2.0.3** — the cards are drawn *inside the game's own frame* by a D3D11 renderer DLL.
 
 Broadcast presentation for FL25: goal cards with the real scorer, minute and
 score, half-time and full-time result cards, a slim live score bug, milestone
@@ -103,11 +103,13 @@ Press **F8** in game.
 | `renderer: NO DLL at ...` in `sider.log` | the file is not where the module looks | re-run `install.bat`; the file must be `<Sider>\ngb-render\NGB_Render.dll` |
 | `ffi off - cannot LoadLibrary` | `luajit.ext.enabled` is not 1 | add it to `sider.ini`, or re-run `install.bat` |
 | `LoadLibraryA failed` | wrong file / wrong architecture | the DLL must be the 64-bit `NGB_Render.dll` from this package |
-| `could not create the probe window` | the hook could not be set up | the game runs normally; send me `ngb-dll.log` |
+| `probe swapchain (hardware) failed: hr=0x...` | the quick way to find the game's picture did not work yet — this is **expected** early on | nothing; the DLL switches to waiting for the game's own swapchain and keeps retrying |
+| `waiting for the game to create its swapchain (factory hook is in place)` | the DLL is standing at the door, waiting for the game to open a picture | normal before a match loads; it changes to the line below as soon as the 3D view exists |
+| `hooks installed via the game's own swapchain: Present=...` | the renderer is live and inside a real frame | if F8 still shows nothing, send `ngb-dll.log` |
+| `no route to the swapchain worked - nothing will be drawn` | honest failure: none of the routes found the game's picture | the game is untouched; send `ngb-dll.log` — the `hr=0x...` lines above it are the reason |
 | `MH_CreateHook(Present) failed` | MinHook could not patch Present | same as above; the C# fallback still works |
 | `MH_EnableHook failed` | same | same |
-| `hooks installed: Present=...` | the renderer is live | if F8 still shows nothing, send `ngb-dll.log` |
-| `Module (NGB_Presentation.lua) is NOT activated` in `sider.log` | start-up raised; the line above it says why | 2.0.2 fixes the `'void' is not callable` error that 2.0.0/2.0.1 always hit — reinstall and it will not appear. Otherwise send `ngb_doctor.txt` |
+| `Module (NGB_Presentation.lua) is NOT activated` in `sider.log` | start-up raised; the line above it says why | 2.0.2 fixed the `'void' is not callable` error that 2.0.0/2.0.1 always hit. If it says something else, send `ngb_doctor.txt` |
 | `FATAL: exception 0x... inside the Present hook` | the renderer caught its own fault and disabled itself | the game keeps running; send me that line and F7's strip |
 
 ### 2. Is the module alive?

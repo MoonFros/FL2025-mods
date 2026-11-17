@@ -1,7 +1,7 @@
 ================================================================================
   NEXT-GEN BROADCAST  -  HOW TO INSTALL IT  (the very simple version)
   MoonFros Presents  -  for Football Life 2025 / PES 2021, with Sider 7
-  Version 2.0.2
+  Version 2.0.3
 ================================================================================
 
 Read this top to bottom. It is written in order. Do not skip step 2.
@@ -223,6 +223,27 @@ version of this mod. Ignore it.
      - A file with "hooks installed" inside? Then the drawing part is alive.
        If F8 still shows nothing, send that file to me.
 
+     - A file with "waiting for the game to create its swapchain" inside?
+       That is normal for the first seconds. The drawer is standing at the
+       door and waiting for the game to open a picture. Start a match; the
+       line then changes to "hooks installed via the game's own swapchain".
+
+  B2. The panel says "DLL loaded, NOT hooked (<something> after N tries)"?
+      Good news first: the drawer IS installed and IS running. It has simply
+      not found the game's picture yet. This is what 2.0.3 changed - in 2.0.2
+      the same situation said "not configured or installed", which was wrong.
+      The brackets name what it tried last, and the line below the panel
+      ("hooking: ...") carries the error codes.
+
+      What to do:
+        1. Start a match. The drawer finds the picture when the 3D match
+           view appears, not in the menus.
+        2. Still says it after a match has loaded? Send ngb-dll.log. The lines
+           with "failed: hr=0x..." are the reason, and they are the only thing
+           I need to fix it.
+      The game is never harmed by this - a drawer that finds nothing simply
+      draws nothing, exactly like before.
+
   C. Does sider.log say "Module (NGB_Presentation.lua) is NOT activated"?
      Look at the line just above it.
 
@@ -234,10 +255,10 @@ version of this mod. Ignore it.
                                       you are done.
 
      The mod's version is written in sider.log on the first line that starts
-     with [NGB]: "Next-Gen Football Broadcast Presentation v2.0.2 starting".
+     with [NGB]: "Next-Gen Football Broadcast Presentation v2.0.3 starting".
 
   D. Freeze or crash when a match ends? Update to 2.0.2 or newer - that exact
-     problem was found and fixed. (This file is 2.0.2.)
+     problem was found and fixed. (This file is 2.0.3.)
 
   E. Player numbers say "UNAVAILABLE"? That is on purpose when the mod has no
      safe way to read memory. It means ngb-render\NGB_Render.dll is not

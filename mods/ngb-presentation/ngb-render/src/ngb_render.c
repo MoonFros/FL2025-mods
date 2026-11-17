@@ -16,12 +16,14 @@
  *      write render.txt / the log next to it).
  */
 #include "ngb.h"
+#include "ngb_plan.h"
 #include "MinHook.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>   /* IDXGIFactory2 / DXGI_SWAP_CHAIN_DESC1 (factory route) */
 
 ngb_cfg_t   g_cfg;
 volatile LONG g_dead = 0;
@@ -50,6 +52,18 @@ static volatile LONG  s_present_faults = 0;
 static volatile LONG  s_debug_on = 0;
 static volatile LONG  s_demo_until = 0;      /* GetTickCount() while demo shows */
 static volatile LONG  s_demo_mode = 0;
+
+/* hook installation plan (see "Finding the swapchain" below); the schedule and
+ * the state names are in src/ngb_plan.h, which tests/plan_test.c proves */
+static volatile LONG s_plan = NGB_PLAN_NONE;
+static volatile LONG s_attempts = 0;
+static volatile LONG s_hr_hw = 0;
+static volatile LONG s_hr_warp = 0;
+static volatile LONG s_factory_ready = 0;
+static volatile LONG s_mh_ok = 0;
+static volatile LONG s_probe_budget = NGB_PROBE_BUDGET;
+static ULONGLONG     s_next_hook_try = 0;
+static int hook_attempt(void);
 
 /* swapchain / window report */
 static volatile LONG  s_bb_w = 0, s_bb_h = 0;
@@ -340,6 +354,13 @@ static DWORD WINAPI poll_thread(LPVOID param)
         __try {
             ngb_state_refresh();
             ULONGLONG now = GetTickCount64();
+            if (!InterlockedCompareExchange(&s_hooked, 1, 1)
+                    && now >= s_next_hook_try) {
+                /* the wait comes from ngb_plan.h, so the schedule is tested */
+                LONG n = InterlockedCompareExchange(&s_attempts, 0, 0);
+                s_next_hook_try = now + ngb_hook_wait_ms((long)n);
+                hook_attempt();
+            }
             if (now - s_last_report >= 1000) {
                 s_last_report = now;
                 write_report();
@@ -467,24 +488,127 @@ static HRESULT STDMETHODCALLTYPE resize_hook(IDXGISwapChain *sc, UINT count, UIN
     return hr;
 }
 
-/* Build a throw-away device + swapchain just to learn the vtbl addresses.
- * This is the standard, version-independent way to find Present/ResizeBuffers
- * without depending on d3d11.dll being already loaded at a fixed address. */
-static int find_swapchain_vtbl(void ***present, void ***resize)
+/* ---------------------------------------------------------------------------
+ *  Finding the swapchain
+ *
+ *  Two independent routes, because the first one can fail:
+ *
+ *   1. PROBE - build a throw-away D3D11 device + swapchain and read its vtable.
+ *      Cheap when it works. It does NOT always work: called from a Sider module
+ *      at start-up this failed on a real machine with "could not create a probe
+ *      swapchain", because no D3D device exists in the process yet and the
+ *      driver has not been initialised. Retrying later is fine, but it is not
+ *      something to bet the whole feature on.
+ *
+ *   2. FACTORY - hook IDXGIFactory::CreateSwapChain / CreateSwapChainForHwnd and
+ *      wait for the GAME to create its own swapchain. IDXGI factory vtables are
+ *      shared per dxgi.dll, so hooking one instance's vtable catches every
+ *      factory in the process - including the ones the game already made and
+ *      the internal one behind D3D11CreateDeviceAndSwapChain. No device of our
+ *      own is needed, which is exactly why it works when the probe does not.
+ *
+ *  The two are tried in order and retried in the background, so "not yet" is
+ *  never reported as "never". The schedule and the state names live in
+ *  src/ngb_plan.h so that tests/plan_test.c can prove them without Windows.
+ * ------------------------------------------------------------------------- */
+
+/* pointers for the factory detours */
+typedef HRESULT (STDMETHODCALLTYPE *CreateSwapChain_t)(IDXGIFactory *, IUnknown *,
+                                                       DXGI_SWAP_CHAIN_DESC *,
+                                                       IDXGISwapChain **);
+typedef HRESULT (STDMETHODCALLTYPE *CreateSwapChainForHwnd_t)(
+        IDXGIFactory2 *, IUnknown *, HWND, const DXGI_SWAP_CHAIN_DESC1 *,
+        const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *, IDXGIOutput *, IDXGISwapChain1 **);
+static CreateSwapChain_t          s_create_orig = NULL;
+static CreateSwapChainForHwnd_t   s_create_hwnd_orig = NULL;
+static void                     **s_create_target = NULL;
+static void                     **s_create_hwnd_target = NULL;
+
+/* Is this address really inside that module? Used to refuse a vtable slot that
+ * is not what we think it is - one wrong index would hook an arbitrary
+ * function, and that is a crash, not a missing card. */
+static int in_module(HMODULE mod, const void *p)
 {
+    if (!mod || !p) return 0;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)mod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    const BYTE *base = (const BYTE *)mod;
+    const BYTE *end = base + nt->OptionalHeader.SizeOfImage;
+    const BYTE *q = (const BYTE *)p;
+    return q >= base && q < end;
+}
+
+static int ensure_minhook(void)
+{
+    if (InterlockedCompareExchange(&s_mh_ok, 1, 1)) return 1;
+    MH_STATUS st = MH_Initialize();
+    if (st != MH_OK) {
+        ngb_log("MinHook initialisation failed (status %d) - cannot hook anything",
+                (int)st);
+        return 0;
+    }
+    InterlockedExchange(&s_mh_ok, 1);
+    return 1;
+}
+
+/* Hook one swapchain's vtable. Safe to call when already hooked. */
+static int hook_swapchain_vtbl(void **present, void **resize, const char *why)
+{
+    if (InterlockedCompareExchange(&s_hooked, 1, 1)) return 1;
+    if (!present) return 0;
+    if (!ensure_minhook()) return 0;
+
+    s_present_target = present;
+    s_resize_target = resize;
+
+    if (MH_CreateHook((LPVOID)present, (LPVOID)present_hook,
+                      (LPVOID *)&s_present_orig) != MH_OK) {
+        ngb_log("MH_CreateHook(Present) failed (found via %s)", why);
+        return 0;
+    }
+    if (resize && MH_CreateHook((LPVOID)resize, (LPVOID)resize_hook,
+                                (LPVOID *)&s_resize_orig) != MH_OK)
+        ngb_log("MH_CreateHook(ResizeBuffers) failed - size changes will blank "
+                "the cards for a frame instead of crashing");
+    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+        ngb_log("MH_EnableHook failed (found via %s)", why);
+        return 0;
+    }
+    InterlockedExchange(&s_hooked, 1);
+    InterlockedExchange(&s_plan, NGB_PLAN_HOOKED);
+    ngb_log("hooks installed via %s: Present=%p ResizeBuffers=%p", why,
+            (void *)present, (void *)resize);
+    return 1;
+}
+
+/* Route 1: a probe device. Returns 0 and reports the HRESULT when it fails. */
+static int probe_vtbl(D3D_DRIVER_TYPE driver, void ***present, void ***resize,
+                      HRESULT *out_hr)
+{
+    *present = NULL;
+    *resize = NULL;
+    if (out_hr) *out_hr = S_OK;
+
     DXGI_SWAP_CHAIN_DESC sd;
     ZeroMemory(&sd, sizeof sd);
-    sd.BufferCount = 1;
+    sd.BufferCount = 2;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.Width = 8;
+    sd.BufferDesc.Height = 8;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     /* A private, never-shown window. Using GetForegroundWindow() here would
      * create a swapchain on whatever the player happens to have in front -
-     * possibly the game itself - which is a good way to break its presentation.
-     * This window is destroyed again before we return. */
-    HWND probe = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "STATIC", "ngb-probe",
-                                 WS_POPUP, 0, 0, 8, 8, NULL, NULL, NULL, NULL);
+     * possibly the game itself - which is a good way to break its
+     * presentation. This window is destroyed again before we return. */
+    HWND probe = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, "STATIC",
+                                 "ngb-probe", WS_POPUP, 0, 0, 8, 8, NULL, NULL,
+                                 NULL, NULL);
     if (!probe) {
-        ngb_log("could not create the probe window - hooks not installed");
+        DWORD err = GetLastError();
+        if (out_hr) *out_hr = HRESULT_FROM_WIN32(err);
+        ngb_log("probe window could not be created (error %lu)", (unsigned long)err);
         return 0;
     }
     sd.OutputWindow = probe;
@@ -498,15 +622,16 @@ static int find_swapchain_vtbl(void ***present, void ***resize)
     D3D_FEATURE_LEVEL fl;
     D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
 
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-                                               &want, 1, D3D11_SDK_VERSION, &sd, &sc,
-                                               &dev, &fl, &ctx);
-    if (FAILED(hr)) {
-        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0,
-                                           &want, 1, D3D11_SDK_VERSION, &sd, &sc,
-                                           &dev, &fl, &ctx);
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, driver, NULL, 0, &want, 1,
+                                               D3D11_SDK_VERSION, &sd, &sc, &dev,
+                                               &fl, &ctx);
+    DestroyWindow(probe);
+    if (FAILED(hr) || !sc) {
+        if (out_hr) *out_hr = hr;
+        if (ctx) ctx->lpVtbl->Release(ctx);
+        if (dev) dev->lpVtbl->Release(dev);
+        return 0;
     }
-    if (FAILED(hr) || !sc) return 0;
 
     void **vtbl = *(void ***)sc;
     *present = (void **)vtbl[8];      /* IDXGISwapChain::Present        */
@@ -515,48 +640,161 @@ static int find_swapchain_vtbl(void ***present, void ***resize)
     sc->lpVtbl->Release(sc);
     if (ctx) ctx->lpVtbl->Release(ctx);
     if (dev) dev->lpVtbl->Release(dev);
-    DestroyWindow(probe);
+    if (!*present) return 0;
     return 1;
 }
 
-static int install_hooks(void)
+/* ---------------------------------------------------------------------------
+ *  Route 2: the factory. The game's own swapchain is the one we want anyway.
+ * ------------------------------------------------------------------------- */
+static void factory_swapchain_seen(IDXGISwapChain *sc)
 {
-    if (MH_Initialize() != MH_OK) {
-        ngb_log("MinHook initialisation failed");
-        return 0;
+    if (!sc || InterlockedCompareExchange(&s_hooked, 1, 1)) return;
+    void **vtbl = *(void ***)sc;
+    if (!vtbl) return;
+    HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+    if (!in_module(dxgi, (void *)vtbl[8])) {
+        ngb_log("the game's swapchain vtable is not in dxgi.dll - not hooking");
+        return;
     }
-    void **present = NULL, **resize = NULL;
-    if (!find_swapchain_vtbl(&present, &resize)) {
-        ngb_log("could not create a probe swapchain - hooks not installed");
-        return 0;
+    if (hook_swapchain_vtbl((void **)vtbl[8], (void **)vtbl[13],
+                            "the game's own swapchain")) {
+        /* our job here is done: stop intercepting swapchain creation */
+        if (s_create_target) MH_DisableHook((LPVOID)s_create_target);
+        if (s_create_hwnd_target) MH_DisableHook((LPVOID)s_create_hwnd_target);
     }
-    s_present_target = present;
-    s_resize_target = resize;
+}
 
-    if (MH_CreateHook((LPVOID)present, (LPVOID)present_hook,
-                      (LPVOID *)&s_present_orig) != MH_OK) {
-        ngb_log("MH_CreateHook(Present) failed");
+static HRESULT STDMETHODCALLTYPE create_swapchain_hook(IDXGIFactory *self,
+                                                       IUnknown *device,
+                                                       DXGI_SWAP_CHAIN_DESC *desc,
+                                                       IDXGISwapChain **out)
+{
+    HRESULT hr = s_create_orig(self, device, desc, out);
+    if (SUCCEEDED(hr) && out && *out) factory_swapchain_seen(*out);
+    return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE create_swapchain_hwnd_hook(
+        IDXGIFactory2 *self, IUnknown *device, HWND hwnd,
+        const DXGI_SWAP_CHAIN_DESC1 *desc,
+        const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *fs, IDXGIOutput *restrict_to,
+        IDXGISwapChain1 **out)
+{
+    HRESULT hr = s_create_hwnd_orig(self, device, hwnd, desc, fs, restrict_to, out);
+    if (SUCCEEDED(hr) && out && *out)
+        factory_swapchain_seen((IDXGISwapChain *)*out);
+    return hr;
+}
+
+static int install_factory_hooks(void)
+{
+    if (InterlockedCompareExchange(&s_factory_ready, 1, 1)) return 1;
+    if (!ensure_minhook()) return 0;
+
+    HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+    if (!dxgi) dxgi = LoadLibraryA("dxgi.dll");
+    if (!dxgi) {
+        ngb_log("dxgi.dll is not loaded - the factory route is not available");
         return 0;
     }
-    if (MH_CreateHook((LPVOID)resize, (LPVOID)resize_hook,
-                      (LPVOID *)&s_resize_orig) != MH_OK)
-        ngb_log("MH_CreateHook(ResizeBuffers) failed - size changes will blank "
-                "the cards for a frame instead of crashing");
-    if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
-        ngb_log("MH_EnableHook failed");
+
+    IDXGIFactory1 *factory = NULL;
+    HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
+    if (FAILED(hr) || !factory) {
+        ngb_log("CreateDXGIFactory1 failed (0x%08lX) - the factory route is not "
+                "available", (unsigned long)hr);
         return 0;
     }
-    InterlockedExchange(&s_hooked, 1);
-    ngb_log("hooks installed: Present=%p ResizeBuffers=%p", (void *)present,
-            (void *)resize);
+
+    void **vtbl = *(void ***)factory;
+    void **create      = (void **)vtbl[10];   /* CreateSwapChain        */
+    void **create_hwnd = (void **)vtbl[11];   /* CreateSwapChainForHwnd */
+
+    /* refuse anything that is not where it should be */
+    if (!in_module(dxgi, (void *)create) || !in_module(dxgi, (void *)create_hwnd)) {
+        ngb_log("the factory vtable does not look like dxgi.dll (10=%p 11=%p) - "
+                "not hooking it", (void *)create, (void *)create_hwnd);
+        factory->lpVtbl->Release(factory);
+        return 0;
+    }
+
+    if (MH_CreateHook((LPVOID)create, (LPVOID)create_swapchain_hook,
+                      (LPVOID *)&s_create_orig) != MH_OK) {
+        ngb_log("MH_CreateHook(CreateSwapChain) failed");
+        factory->lpVtbl->Release(factory);
+        return 0;
+    }
+    s_create_target = create;
+    if (MH_CreateHook((LPVOID)create_hwnd, (LPVOID)create_swapchain_hwnd_hook,
+                      (LPVOID *)&s_create_hwnd_orig) != MH_OK)
+        ngb_log("MH_CreateHook(CreateSwapChainForHwnd) failed - only the plain "
+                "path will be watched");
+    else
+        s_create_hwnd_target = create_hwnd;
+    if (MH_EnableHook((LPVOID)create) != MH_OK) {
+        ngb_log("MH_EnableHook(CreateSwapChain) failed");
+        factory->lpVtbl->Release(factory);
+        return 0;
+    }
+    if (s_create_hwnd_target) MH_EnableHook((LPVOID)create_hwnd);
+    factory->lpVtbl->Release(factory);
+
+    InterlockedExchange(&s_factory_ready, 1);
+    InterlockedExchange(&s_plan, NGB_PLAN_FACTORY);
+    ngb_log("waiting for the game to create its swapchain (factory hook is in "
+            "place) - the cards hook themselves when it does");
     return 1;
+}
+
+/* One attempt. Returns 1 = hooked, 2 = pending (factory is waiting), 0 = not
+ * yet (will be retried). */
+static int hook_attempt(void)
+{
+    if (InterlockedCompareExchange(&s_hooked, 1, 1)) return 1;
+    LONG n = InterlockedIncrement(&s_attempts);
+
+    if (InterlockedCompareExchange(&s_probe_budget, 0, 0) > 0) {
+        void **present = NULL, **resize = NULL;
+        HRESULT hr = S_OK;
+        InterlockedExchange(&s_plan, NGB_PLAN_PROBE_HW);
+        if (probe_vtbl(D3D_DRIVER_TYPE_HARDWARE, &present, &resize, &hr)) {
+            return hook_swapchain_vtbl(present, resize, "a probe swapchain");
+        }
+        InterlockedExchange(&s_hr_hw, (LONG)hr);
+        ngb_log("probe swapchain (hardware) failed: hr=0x%08lX, trying WARP",
+                (unsigned long)hr);
+
+        InterlockedExchange(&s_plan, NGB_PLAN_PROBE_WP);
+        if (probe_vtbl(D3D_DRIVER_TYPE_WARP, &present, &resize, &hr)) {
+            return hook_swapchain_vtbl(present, resize, "a probe swapchain (WARP)");
+        }
+        InterlockedExchange(&s_hr_warp, (LONG)hr);
+        ngb_log("probe swapchain (WARP) failed: hr=0x%08lX", (unsigned long)hr);
+        InterlockedDecrement(&s_probe_budget);
+        if (InterlockedCompareExchange(&s_probe_budget, 0, 0) <= 0)
+            ngb_log("probe route exhausted after %ld attempts - switching to the "
+                    "factory route until the game creates its swapchain", (long)n);
+    }
+
+    if (install_factory_hooks()) return 2;
+
+    if (!InterlockedCompareExchange(&s_hooked, 1, 1)) {
+        InterlockedExchange(&s_plan, NGB_PLAN_GAVE_UP);
+        ngb_log("no route to the swapchain worked - nothing will be drawn. "
+                "Send this log; the HRESULTs above say why.");
+    }
+    return 0;
 }
 
 static void remove_hooks(void)
 {
+    if (s_create_target) MH_DisableHook((LPVOID)s_create_target);
+    if (s_create_hwnd_target) MH_DisableHook((LPVOID)s_create_hwnd_target);
     if (!InterlockedCompareExchange(&s_hooked, 0, 1)) return;
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();
+    InterlockedExchange(&s_mh_ok, 0);
     ngb_log("hooks removed");
 }
 
@@ -646,12 +884,22 @@ __declspec(dllexport) int NGB_Start(const char *config)
         ngb_log("state.json not readable yet - the renderer keeps trying, "
                 "and the HUD will appear as soon as a match starts");
 
-    if (!install_hooks()) {
-        ngb_log("renderer NOT active - the game runs normally, nothing is drawn");
-        return 0;
+    /* One attempt now - it usually succeeds instantly when the game is already
+     * up - then the poll thread keeps retrying. Never return 0 here: 0 makes
+     * the Lua module fall back to the C# window, which is not what we want.
+     * "not hooked yet" is a state, not a failure, and the diagnostics panel
+     * shows it as hooks=0 until it resolves. */
+    int r = hook_attempt();
+    if (r == 1) {
+        ngb_log("renderer active: cards are drawn inside the game's own frame "
+                "(windowed, borderless and fullscreen, focused or not)");
+    } else if (r == 2) {
+        ngb_log("renderer waiting: the factory hook is in place, the cards will "
+                "appear on the first frame after the game creates its swapchain");
+    } else {
+        ngb_log("renderer not hooked yet (plan=%s) - retrying in the background; "
+                "the game runs normally meanwhile", ngb_plan_name((int)s_plan));
     }
-    ngb_log("renderer active: cards are drawn inside the game's own frame "
-            "(windowed, borderless and fullscreen, focused or not)");
 
     s_stop_poll = 0;
     s_poll_thread = CreateThread(NULL, 0, poll_thread, NULL, 0, NULL);
@@ -669,10 +917,13 @@ __declspec(dllexport) const char *NGB_GetState(void)
     int age = ngb_state_age_ms();
     snprintf(buf, sizeof buf,
              "version=%s;hooks=%d;enabled=%d;faults=%d;frames=%d;backbuffer=%dx%d;"
-             "state_age_ms=%d;state_seq=%d;dead=%d;read=1;query=1;log=%s",
+             "state_age_ms=%d;state_seq=%d;dead=%d;read=1;query=1;"
+             "hook_plan=%s;hook_tries=%ld;hr_hw=0x%08lX;hr_warp=0x%08lX;log=%s",
              NGB_VERSION, (int)s_hooked, g_enabled ? 1 : 0,
              (int)s_present_faults, (int)s_frames, (int)s_bb_w, (int)s_bb_h,
-             age, st.state_seq, g_dead ? 1 : 0, s_log_file);
+             age, st.state_seq, g_dead ? 1 : 0, ngb_plan_name((int)s_plan),
+             (long)s_attempts, (unsigned long)(DWORD)s_hr_hw,
+             (unsigned long)(DWORD)s_hr_warp, s_log_file);
     return buf;
 }
 
