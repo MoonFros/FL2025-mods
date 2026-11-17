@@ -30,6 +30,7 @@ import os
 import re
 import struct
 import sys
+import subprocess
 import tempfile
 import zlib
 
@@ -117,6 +118,12 @@ def lua_static_checks():
           and "player_stats_ok" in src)
     check("lua: ini self-check (match-stats)", "check_ini_flags" in src and "match%-stats" in src)
     check("lua: calibration probe", "probe_write" in src and "probe.txt" in src)
+    check("lua: layout overrides from ini / calibration file",
+          "apply_layout" in src and "read_calibration" in src
+          and "calibration.txt" in src)
+    check("lua: raw region dump for the decoder",
+          "probe_dump" in src and "probe_region.bin" in src)
+    check("lua: bucket count is configurable", "BUCKETS" in src and "stat_buckets" in src)
     check("lua: creates its state folder defensively",
           "ensure_dir" in src and "make_dirs" in src and "create_directory" in src)
     check("lua: presentation styles", "cycle_style" in src and "STYLE_NAMES" in src)
@@ -263,6 +270,9 @@ def cs_checks():
     check("cs: player stats gate", "PlayerStats" in src and "bool stats = st == null || st.PlayerStats" in src)
     check("cs: startup / no-state card", "DrawStartupCard" in src and "waiting for" in src)
     check("cs: version const", "public const string VERSION" in src)
+    check("cs: sample cards are labelled", "SAMPLE DATA" in src and "DrawDemoBadge" in src)
+    check("cs: shot card shows the shot panel when telemetry exists",
+          "bool analysis = style == 0 && ev.Shot != null" in src)
     check("cs: reads the data block", "\"player_stats\"" in src and "scorer_hook" in src)
     check("cs: no external nuget deps",
           not re.search(r"using\s+Newtonsoft", src))
@@ -558,6 +568,37 @@ def packaging_checks():
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 7b. Calibration tool
+# ---------------------------------------------------------------------------
+def calibration_checks():
+    path = os.path.join(ROOT, "tools", "decode_probe.py")
+    if not os.path.exists(path):
+        return check("calibration: decoder present", False, path)
+    src = read(path)
+    check("calibration: decoder present", True)
+    check("calibration: writes calibration.txt", "calibration.txt" in src)
+    check("calibration: has a selftest", "--selftest" in src and "def selftest" in src)
+    try:
+        import numpy  # noqa: F401
+        have_np = True
+    except Exception:
+        have_np = False
+    if not have_np:
+        results.append(("calibration: selftest finds the layout", None,
+                        "pip install numpy"))
+        return
+    try:
+        out = subprocess.run([sys.executable, path, "--selftest"],
+                             capture_output=True, text=True, timeout=300)
+    except Exception as exc:  # pragma: no cover - environment dependent
+        results.append(("calibration: selftest finds the layout", None, str(exc)))
+        return
+    ok = out.returncode == 0 and out.stdout.count("PASS") >= 3
+    tail = (out.stdout or out.stderr).strip().splitlines()
+    check("calibration: selftest finds the layout", ok, tail[-1] if tail else "")
+
+
 def main():
     verbose = "--verbose" in sys.argv
     lua_static_checks()
@@ -566,6 +607,7 @@ def main():
     html_checks()
     player_bin_fixture()
     packaging_checks()
+    calibration_checks()
     lua_runtime_checks(verbose)
 
     failed = [r for r in results if r[1] is False]

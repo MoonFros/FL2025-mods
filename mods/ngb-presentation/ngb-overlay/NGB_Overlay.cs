@@ -1290,6 +1290,7 @@ namespace Ngbfc.Presentation
             if (toastOn && _toast != null)
                 DrawToast(g, _toast, _clock.Elapsed.TotalSeconds - _toastStart, _winW, s);
             if (startup) DrawStartupCard(g, _winW, _winH, s);
+            if (_demoPhase != 0) DrawDemoBadge(g, _winW, s);
             if (_diag) DrawDiagnostics(g, st, _winW, _winH, s);
 
             _rt.Present(Handle, _winX, _winY);
@@ -1471,9 +1472,12 @@ namespace Ngbfc.Presentation
 
             if (style >= 2) { DrawMinimalBar(g, ev, st, w, h, s, t, team); return; }
 
+            bool analysis = style == 0 && ev.Shot != null &&
+                            (ev.Shot.Traj.Count >= 2 || ev.Shot.OriginX != 0 || ev.Shot.OriginY != 0);
+
             float k = style == 1 ? 0.86f : 1f;
-            float pw = 800f * s * k;
-            float ph = 218f * s * k;
+            float pw = (analysis ? 1120f : 800f) * s * k;
+            float ph = (analysis ? 320f : 218f) * s * k;
             float px = 56 * s;
             float py = h - 56 * s - ph;
             if (py < 24 * s) py = 24 * s;
@@ -1483,9 +1487,17 @@ namespace Ngbfc.Presentation
             Draw.GlassPanel(g, r, 9 * s, team);
             float cx = r.Left + 32 * s;
             DrawKicker(g, ev, r, team, s, false);
-            DrawPlayerBlock(g, ev, cx, r.Top + 52 * s, pw - 64 * s, s, team, t);
+            DrawPlayerBlock(g, ev, cx, r.Top + 52 * s,
+                            analysis ? 520f * s * k : pw - 64 * s, s, team, t);
             DrawShotCells(g, ev, cx, r.Bottom - 76 * s, 4, s, team, t, 132 * s);
-            DrawFooter(g, st, ev, r, s, false);
+            DrawFooter(g, st, ev, r, s, analysis);
+
+            if (analysis)
+            {
+                var box = new RectangleF(r.Right - 32 * s - 460 * s, r.Top + 20 * s,
+                                         460 * s, ph - 74 * s);
+                DrawAnalysisPanel(g, box, ev, team, s, elapsed, t);
+            }
         }
 
         // ---------------------------------------------------------------------
@@ -2048,6 +2060,24 @@ namespace Ngbfc.Presentation
             return "..." + path.Substring(path.Length - 59);
         }
 
+        // ---------------------------------------------------------------------
+        //  Demo badge: F10 draws sample cards, and sample cards must say so
+        // ---------------------------------------------------------------------
+        private void DrawDemoBadge(Graphics g, int w, float s)
+        {
+            string text = "DEMO  ·  SAMPLE DATA";
+            float tw = Draw.SpacedWidth(g, text, _theme.Micro, 1.6f * s);
+            var r = new RectangleF(w * 0.5f - tw * 0.5f - 14 * s, 34 * s, tw + 28 * s, 24 * s);
+            using (var back = new SolidBrush(Color.FromArgb(235, 138, 109, 31)))
+            using (var edge = new Pen(Color.FromArgb(200, 233, 200, 122), 1f))
+            {
+                g.FillRectangle(back, r);
+                g.DrawRectangle(edge, r.X, r.Y, r.Width, r.Height);
+            }
+            using (var white = new SolidBrush(Theme.White))
+                Draw.Spaced(g, text, _theme.Micro, white, r.Left + 14 * s, r.Top + 6 * s, 1.6f * s);
+        }
+
         private void DrawDiagnostics(Graphics g, HudState st, int w, int h, float s)
         {
             float pw = 560 * s, ph = 330 * s;
@@ -2267,7 +2297,7 @@ namespace Ngbfc.Presentation
     internal static class Program
     {
         [STAThread]
-        public const string VERSION = "1.1.0";
+        public const string VERSION = "1.2.0";
 
         private static void Main(string[] args)
         {
