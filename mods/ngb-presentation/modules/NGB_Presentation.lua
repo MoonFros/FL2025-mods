@@ -28,7 +28,7 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "1.1.0"
+m.VERSION = "1.2.0"
 m.STATE_VERSION = 3
 
 -- ============================================================================
@@ -481,6 +481,83 @@ local OFF = {
     PITCH_BLOCK     = 0x253FC,
     PITCH_ENTRY     = 12,       -- 3 x f32 (x, y, z) in metres
 }
+
+-- ---------------------------------------------------------------------------
+-- Per-player table layout: the defaults above, overridable WITHOUT editing this
+-- file, from two places (later wins):
+--   1. content\ngb-presentation\calibration.txt   written by tools/decode_probe.py
+--   2. NGB_Presentation.ini   stat_rec_base / stat_side_stride / stat_rec_stride /
+--                             stat_kind_stride / stat_kind_offset / stat_buckets
+-- A layout is only ever used for display after m.validate_stats() reproduces the
+-- scoreboard with it; a wrong layout therefore produces no numbers at all.
+-- ---------------------------------------------------------------------------
+local BUCKETS = 8
+
+local LAYOUT_FIELDS = {
+    stat_rec_base    = "REC_BASE",
+    stat_side_stride = "REC_SIDE",
+    stat_rec_stride  = "REC_IDX",
+    stat_kind_stride = "KIND_STRIDE",
+    stat_kind_offset = "KIND_OFFSET",
+    stat_buckets     = "BUCKETS",
+}
+
+function m.layout()
+    return {
+        rec_base = OFF.REC_BASE, side = OFF.REC_SIDE, idx = OFF.REC_IDX,
+        kind = OFF.KIND_STRIDE, kind_off = OFF.KIND_OFFSET, buckets = BUCKETS,
+    }
+end
+
+function m.apply_layout(t, tag)
+    if type(t) ~= "table" then return 0 end
+    local n = 0
+    for key, field in pairs(LAYOUT_FIELDS) do
+        local v = t[key]
+        if v == nil then v = t[string.lower(field)] end
+        local num = nil
+        if type(v) == "number" then num = v
+        elseif type(v) == "string" then num = parse_hex(v) or tonumber(v) end
+        if num then
+            num = floor(num)
+            if num >= 0 and num <= 0x4000000 then
+                if field == "BUCKETS" then
+                    if num >= 1 and num <= 16 then
+                        BUCKETS = num
+                        OFF.BUCKETS = num
+                        n = n + 1
+                    end
+                else
+                    OFF[field] = num
+                    n = n + 1
+                end
+            end
+        end
+    end
+    if n > 0 and tag then
+        log_msg(string.format(
+            "layout from %s: rec_base %s  side %s  idx %s  kind %s  buckets %d",
+            tostring(tag), hex(OFF.REC_BASE), hex(OFF.REC_SIDE), hex(OFF.REC_IDX),
+            hex(OFF.KIND_STRIDE), BUCKETS))
+    end
+    return n
+end
+
+-- calibration.txt: "key = value" lines, hex or decimal, '#' comments
+function m.read_calibration(dir)
+    if not dir then return nil end
+    local f = io.open(dir .. "\\calibration.txt", "r")
+    if not f then return nil end
+    local text = f:read("*a") or ""
+    f:close()
+    local out = {}
+    for line in string.gmatch(text, "[^\r\n]+") do
+        line = string.gsub(line, "#.*$", "")
+        local k, v = string.match(line, "^%s*([%w_]+)%s*=%s*([^%s]+)")
+        if k then out[string.lower(k)] = v end
+    end
+    return out
+end
 
 -- Region header signatures: { 0, size - 0x20, 1 } as 3 x u32.
 local REGION_STATS_SIZE = 0x18FFE0
@@ -1035,8 +1112,15 @@ local function rec_addr(side, idx)
 end
 m.rec_addr = rec_addr
 
--- sum of the 8 period buckets for stat kind `k`, buffer relative
+-- sum of the period buckets for stat kind `k`, buffer relative.
+-- 8 buckets is the normal layout; anything else (only ever set by a calibration
+-- file) takes the slow loop.
 local function sum8(off)
+    if BUCKETS ~= 8 then
+        local total = 0
+        for i = 0, BUCKETS - 1 do total = total + m.u32(off + i * 4) end
+        return total
+    end
     local a = m.u32(off)
     local b = m.u32(off + 4)
     local c = m.u32(off + 8)
@@ -1737,6 +1821,61 @@ local function hexdump(buf, len, base)
     return table.concat(out, "\n")
 end
 
+-- ============================================================================
+-- 14c. Region dump (calibration input for tools/decode_probe.py)
+-- ============================================================================
+-- Writes <Sider>\content\ngb-presentation\probe_region.bin: the private stats
+-- region byte for byte, plus a small .txt with the base address, the score and
+-- the layout in force. The decoder reconstructs the record grid from the file
+-- alone; nothing here changes what the mod displays.
+function m.probe_dump(dir)
+    if not ffi_ok or not dir then return false end
+    if m.probe_dumped then return false end
+    local base = m.reg.stats or 0
+    if base == 0 then
+        log_msg("region dump skipped: no stats region located yet")
+        return false
+    end
+    local span = REGION_STATS_SIZE
+    if span > 0x400000 then span = 0x400000 end
+    local f = io.open(dir .. "\\probe_region.bin", "wb")
+    if not f then
+        log_msg("cannot write probe_region.bin")
+        return false
+    end
+    local written = 0
+    local chunk = 0x4000
+    while written < span do
+        local n = chunk
+        if written + n > span then n = span - written end
+        local bytes = m.read_big(base + written, n)
+        if not bytes or #bytes < n then break end
+        f:write(bytes)
+        written = written + n
+    end
+    f:close()
+    m.probe_dumped = true
+
+    local meta = io.open(dir .. "\\probe_region.txt", "w")
+    if meta then
+        local L = m.layout()
+        local h, a = current_score()
+        meta:write("ngb region dump\n")
+        meta:write(string.format("module %s\n", m.VERSION))
+        meta:write(string.format("region_base %s\n", hex(base)))
+        meta:write(string.format("size %d\n", written))
+        meta:write(string.format("score %d %d\n", h, a))
+        meta:write(string.format(
+            "layout rec_base %s side %s idx %s kind %s kind_off %s buckets %d\n",
+            hex(L.rec_base), hex(L.side), hex(L.idx), hex(L.kind), hex(L.kind_off), L.buckets))
+        meta:write("\nall offsets below are relative to region_base; hand the .bin and\n")
+        meta:write("this .txt to tools/decode_probe.py (or send them to the author).\n")
+        meta:close()
+    end
+    log_msg(string.format("region dump written: base %s  %d bytes", hex(base), written))
+    return true
+end
+
 function m.probe_write(tag)
     if not m.state.dir then return end
     local f = io.open(m.state.dir .. "\\probe.txt", "a")
@@ -1760,6 +1899,30 @@ function m.probe_write(tag)
     end
     f:write(string.format("guessed stats region %s  pitch region %s  validated %s\n",
         hex(m.reg.stats or 0), hex(m.reg.pitch or 0), tostring(m.stats_validated)))
+
+    -- the layout currently in force, so a decoder knows what was already tried
+    local L = m.layout()
+    f:write(string.format("LAYOUT rec_base %s  side %s  idx %s  kind %s  kind_off %s  buckets %d\n",
+        hex(L.rec_base), hex(L.side), hex(L.idx), hex(L.kind), hex(L.kind_off), L.buckets))
+
+    -- one line per squad slot: what the current layout decodes to
+    if m.reg.stats and m.reg.stats ~= 0 then
+        f:write("PLAYERS side idx goals own assists shots on_target passes touches rating\n")
+        for side = 0, 1 do
+            for idx = 0, 39 do
+                local ps = m.read_player_stats(side, idx)
+                if ps then
+                    f:write(string.format("%d %d %d %d %d %d %d %d %d %s\n", side, idx,
+                        ps.goals or 0, ps.own_goals or 0, ps.assists or 0, ps.shots or 0,
+                        ps.on_target or 0, ps.passes or 0, ps.touches or 0,
+                        ps.rating and string.format("%.2f", ps.rating) or "nil"))
+                end
+            end
+        end
+    end
+
+    -- raw dump, for tools/decode_probe.py (probe_dump_region = 1)
+    if cfg_i("probe_dump_region", 0) ~= 0 then m.probe_dump(m.state.dir) end
     local buf, sci = nil, m.match.sci
     if sci and sci ~= 0 then
         buf = m.read_big(sci, 0x200)
@@ -3069,6 +3232,11 @@ function m.init(ctx)
     end
 
     m.init_state_path(ctx)
+
+    -- per-player table layout: a calibration file from tools/decode_probe.py
+    -- first, then the ini (an explicit ini value always wins)
+    m.apply_layout(m.read_calibration(m.state.dir), "calibration.txt")
+    m.apply_layout(cfg, "NGB_Presentation.ini")
 
     -- handlers (kept on m so the module table cannot be collected)
     ctx.register("display_frame", m.on_display_frame)

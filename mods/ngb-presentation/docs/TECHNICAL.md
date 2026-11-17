@@ -425,7 +425,7 @@ about 2 KB, so a reader is never more than one tick behind. Schema version **3**
 ```json
 {
   "v": 3, "seq": 842, "ts": 918273,
-  "module": "Next-Gen Broadcast", "version": "1.1.0",
+  "module": "Next-Gen Broadcast", "version": "1.2.0",
   "hud": { "enabled": true, "master": true, "style": 0, "analysis": true,
            "units": "metric", "scorebug": true,
            "credit": "MOONFROS PRESENTS", "author": "MoonFros",
@@ -496,32 +496,78 @@ popping it early.
 
 ## 7. Calibrating tier 2 on a new build
 
-`experimental_player_stats` and `probe_enabled` are the whole toolchain; there is
-no manual address hunting required to *start*, and no guessing ever reaches the
-screen.
+The layout is data, not code: `NGB_Presentation.lua` keeps the compiled defaults
+in `OFF` and `m.apply_layout()` can replace six of them at start-up.
 
-1. Set both keys to `1` in `NGB_Presentation.ini`, start a match.
-2. `content\ngb-presentation\probe.txt` is written on every goal and on the
-   diagnostics hotkey: scoreboard values (score, clock, period, stage), a
-   hexdump of the scoreboard block, and the private regions found by the
-   `VirtualQuery` header scan. `sider.log` carries the same lines prefixed
-   `[NGB]`.
-3. The overlay's F11 diagnostics panel prints the tier-2 verdict line
-   (`PLAYER DATA ok/off`, plus why it failed).
-4. If the table moved, update the candidate constants in
-   `NGB_Presentation.lua`: `REGION_STATS_SIZE`, `OFF.REC_BASE`, `OFF.REC_STRIDE`,
-   `OFF.SIDE_STRIDE`, `KIND`. The base can also be pinned directly:
-   ```ini
-   stats_region_base = 0x7E0000
-   pitch_region_base = 0x7B0000
-   ```
-5. Restart, score a goal. When validation passes, the stat row appears on goal
-   cards by itself and the shot/miss/save cards start firing.
+| ini / calibration.txt key | `OFF` field | default |
+|---|---|---|
+| `stat_rec_base` | `REC_BASE` | `0x7B5C0` |
+| `stat_side_stride` | `REC_SIDE` | `0x59650` |
+| `stat_rec_stride` | `REC_IDX` | `0x2134` |
+| `stat_kind_stride` | `KIND_STRIDE` | `0x24` |
+| `stat_kind_offset` | `KIND_OFFSET` | `0x08` |
+| `stat_buckets` | `BUCKETS` | `8` |
 
-Replay camera (unrelated to tier 2): add or replace a pattern in `CAM_PATTERNS`
-(literal bytes plus a `check()` that returns the float offset and the expected
-default). A wrong pattern is harmless - it finds nothing and the camera is left
-untouched.
+Precedence: defaults → `content\ngb-presentation\calibration.txt` →
+`NGB_Presentation.ini`. Deleting `calibration.txt` resets to the defaults.
+A value that is not a number, negative, or out of range is ignored, and a layout
+is only *displayed* after `m.validate_stats()` reproduces the scoreboard with it
+(§2, tier 2), so a bad calibration cannot put false numbers on screen.
+
+### The one-file workflow
+
+```
+experimental_player_stats = 1
+probe_enabled             = 1
+probe_dump_region         = 1
+```
+
+On the first goal (and on the diagnostics hotkey) the module writes:
+
+| file | contents |
+|---|---|
+| `probe.txt` | scoreboard values, hexdump of `SCOREBOARD_INFO`, the region map from `VirtualQuery`, the layout in force (`LAYOUT`), and per-slot decoded rows (`PLAYERS`) |
+| `probe_region.bin` | the located private stats region, byte for byte (≤ 4 MB, once per session, 16 KB `ReadProcessMemory` chunks) |
+| `probe_region.txt` | `region_base`, size, score, layout |
+
+`tools/decode_probe.py` then searches that dump:
+
+```
+python3 tools/decode_probe.py probe_region.bin [--write <content dir>] [--selftest]
+```
+
+How the search works — no heuristics that can invent a number:
+
+1. `G[o] = Σ u32(o..o+28)` is computed once for every 4-byte offset: the goal
+   kind is eight period buckets, so a candidate goal field is a sliding sum.
+2. For each candidate `(rec_stride, side_stride)`, every aligned offset whose
+   40-record sum equals the home score **and** whose second block of 40 equals
+   the away score is collected (vectorised with numpy).
+3. Candidates must still look like a football match: per side ≥ 12 players with
+   a rating inside `[3.0, 10.0]`, ≥ 12 slots with passes or touches, per-player
+   `shots ≤ 60`, `on_target ≤ shots`, `goals ≤ 12`.
+4. Survivors are ranked by how many slots carry a rating, which is what
+   separates the true base from the same grid shifted by a record or two.
+
+`--selftest` builds a synthetic region (allocator header, 40 records per side,
+eight buckets, float ratings), runs the same search and asserts three things:
+the default layout is recovered, a region moved by `0x8000` is recovered at the
+new base, and a wrong score produces no candidate at all. It runs inside the
+offline check suite, so the decoder is exercised on every verification run.
+
+### If the table is not in that region
+
+`probe.txt` carries the `VirtualQuery` map with the first 64 bytes of every
+committed region ≥ 64 KB. A different build may put the per-player table in a
+region with a different size/header; the `PLAYERS` block then shows all zeros.
+In that case the dump and the map are the evidence needed to add the new
+signature to `scan_regions()`.
+
+### Replay camera (unrelated to tier 2)
+
+Add or replace a pattern in `CAM_PATTERNS` (literal bytes plus a `check()` that
+returns the float offset and the expected default). A wrong pattern is harmless:
+it finds nothing and the camera is left untouched.
 
 ---
 

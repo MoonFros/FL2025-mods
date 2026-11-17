@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.1.0
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.2.0
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: goal cards with the real
@@ -13,7 +13,10 @@ overlay.
 Everything on screen comes from Sider's own match library and goal hook, which
 read the game directly. Nothing is guessed, and nothing is filled with zeros.
 
-1.1.0 is a rewrite of the data layer: the previous version tried to find the
+1.2.0 adds the calibration toolchain (section 6) and labels the F10 demo cards
+as sample data, so you can watch every animation on your own PC without a match.
+
+1.1.0 was a rewrite of the data layer: the previous version tried to find the
 per-player statistics table by scanning memory with guessed offsets, which
 produced the famous "0 shots, 0 minutes, id #0" cards on builds where those
 offsets were wrong. That is gone. See section 6 for exactly what is measured,
@@ -181,7 +184,7 @@ TIER 2 - the per-player statistics table, off until calibrated
   Shots, shots on target, passes, ratings, assists and the engine's minutes live
   in a per-player table inside the game's memory. Its location is specific to
   the exact FL_2025.exe build. The previous version guessed it, which is where
-  the "0 shots, 0 min, id #0" cards came from. 1.1.0 does not guess:
+  the "0 shots, 0 min, id #0" cards came from. This version does not guess:
 
     * experimental_player_stats = 0 by default.
     * When you set it to 1, the mod reads its candidate table and validates it
@@ -189,8 +192,28 @@ TIER 2 - the per-player statistics table, off until calibrated
       a goal total that covers the score. Only a table that passes is used.
     * probe_enabled = 1 writes content\ngb-presentation\probe.txt with the
       scoreboard values, a hexdump of the scoreboard block and a map of the
-      game's memory regions - the data needed to pin the table down for a new
-      build.
+      game's memory regions.
+
+  CALIBRATION IN ONE FILE (recommended)
+    1. In NGB_Presentation.ini set:
+           experimental_player_stats = 1
+           probe_enabled             = 1
+           probe_dump_region         = 1
+    2. Play until a goal is scored, then quit the game.
+       content\ngb-presentation\ now holds probe_region.bin (the private region,
+       up to 4 MB) and probe_region.txt (its address, the score, the layout).
+    3. Run the decoder on those two files:
+           python tools\decode_probe.py probe_region.bin --write "C:\path\content\ngb-presentation"
+       It searches the dump for the record grid whose goal counts reproduce the
+       scoreboard and writes calibration.txt. The mod reads that file at start.
+    4. Start the game. Goal cards now carry the stat row, and miss/save cards
+       and shot telemetry switch on by themselves once validation passes.
+    No Python? Send probe_region.bin and probe_region.txt and the decoder runs
+    on the other side; the answer is a six line calibration.txt.
+
+  The layout can also be pinned by hand in the ini (stat_rec_base,
+  stat_side_stride, stat_rec_stride, stat_kind_stride, stat_kind_offset,
+  stat_buckets) - the six numbers the decoder prints.
 
 TIER 3 - modelled, never presented as measured
   Shot speed, apex, hang time, elevation and xG are computed from real distance,
@@ -255,10 +278,10 @@ and nothing is filled with zeros to look complete.
 
   Shots / assists / ratings show nothing
     - That is tier 2 (section 6): the per-player table is not calibrated for
-      your exe build. Set experimental_player_stats = 1 and probe_enabled = 1 in
-      NGB_Presentation.ini, play until a goal, then look at
-      content\ngb-presentation\probe.txt. Until the table validates, the cards
-      stay clean instead of printing zeros.
+      your exe build. Follow "calibration in one file" in section 6: set the
+      three keys, play until a goal, then run tools\decode_probe.py on
+      probe_region.bin. Until the table validates, the cards stay clean instead
+      of printing zeros.
 
   "WARNING: LuaJIT FFI is off" in sider.log
     - Add luajit.ext.enabled = 1 to sider.ini (install.bat does this).
@@ -316,6 +339,17 @@ and nothing is filled with zeros to look complete.
 --------------------------------------------------------------------------------
 11. CHANGES
 --------------------------------------------------------------------------------
+
+  1.2.0  Calibration toolchain.
+         - probe_dump_region writes the private stats region byte for byte
+         - tools/decode_probe.py finds the record grid that reproduces the
+           scoreboard and writes calibration.txt (delete it to reset)
+         - the per player layout can be pinned from calibration.txt or the ini,
+           so a rebuild needs no source edit
+         - the in-game shot card now draws the animated shot-data panel whenever
+           an event carries telemetry
+         - F10 demo cards carry a DEMO - SAMPLE DATA badge, so the animations
+           can be previewed without a match and never pass for live data
 
   1.1.0  Data layer rewritten around Sider's own match library and goal hook.
          - goals, scorer name, minute, score, half time, full time and the score

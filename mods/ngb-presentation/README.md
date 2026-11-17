@@ -1,7 +1,7 @@
 # Next-Gen Football Broadcast Presentation
 
 **MOONFROS PRESENTS** · created by **MoonFros** · for Football Life 2025 / PES 2021 (Sider 7)
-**v1.1.0** — data layer rewritten around Sider's own match library and goal hook.
+**v1.2.0** — engine-truth data layer plus a one-file calibration toolchain for per-player stats.
 
 A broadcast presentation layer for FL25: goal cards with the real scorer, minute
 and score, half-time and full-time result cards, a slim live score bug and
@@ -14,7 +14,7 @@ milestone call-outs, drawn over the game by a transparent click-through overlay.
 | **Half time / full time** | result, final score, every scorer with minute and team | engine |
 | **Score bug** | clock, score, penalty score in a shootout | engine |
 | **Milestone toast** | `OPENER` / `BRACE` / `HAT-TRICK` / `N GOALS`, counted from goals actually seen | engine |
-| **Player stat row** | shots, on target, goals, assists, minutes, rating | tier 2, after calibration |
+| **Player stat row** | shots, on target, goals, assists, minutes, rating | tier 2, after calibration (`tools/decode_probe.py`) |
 | **Shot / miss / save** | shot data, miss and save cards, telemetry | tier 2, after calibration |
 | **MOTM** | gold full-time reveal with the full stat block | tier 2, after calibration |
 
@@ -36,6 +36,23 @@ measured / calibrated / modelled breakdown.
 
 You never need `Start_NGB_Overlay.bat` again after the first install: the Lua
 module launches the overlay itself at game start.
+
+Press **F10** at any time to preview the animated goal, shot-data and MOTM cards.
+They carry a `DEMO · SAMPLE DATA` badge — the live overlay only ever shows
+numbers read from the game.
+
+## Unlocking the per-player numbers
+
+1. `NGB_Presentation.ini`: `experimental_player_stats = 1`, `probe_enabled = 1`,
+   `probe_dump_region = 1`.
+2. Play until a goal, quit. `content\ngb-presentation\` now has
+   `probe_region.bin` + `probe_region.txt`.
+3. `python tools/decode_probe.py probe_region.bin --write "<...>\content\ngb-presentation"`
+4. Start the game: stat rows, shot data, miss and save cards switch on once the
+   layout validates against the scoreboard.
+
+`tools/decode_probe.py --selftest` proves the decoder on synthetic data — it is
+part of the offline check suite.
 
 Uninstall with **`uninstall.bat`** — it removes only this mod's files and its own
 `sider.ini` lines.

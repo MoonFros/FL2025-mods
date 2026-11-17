@@ -14,7 +14,8 @@ Files
   NGB_Overlay.log           created at runtime, rotated at 512 KB
 
 Overlay-only hotkeys  (the in-game presentation keys are 7 / 8 / 9)
-  F10   cycle demo card   (goal -> shot -> MOTM -> off)
+  F10   cycle demo card   (goal -> shot with shot data -> MOTM -> off)
+        demo cards carry a "DEMO - SAMPLE DATA" badge on purpose
   F11   diagnostics panel
   F12   quit
 

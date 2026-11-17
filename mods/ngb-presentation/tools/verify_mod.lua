@@ -679,4 +679,64 @@ m.on_key_down(CTX, 0x38)
 check("hotkey [8] switches the presentation back on", hud_now().master == true, tostring(hud_now().master))
 
 
+-- ---------------------------------------------------------------------------
+-- 10c. Layout overrides (ini / calibration.txt) and the calibration probe
+-- ---------------------------------------------------------------------------
+local L0 = m.layout()
+check("layout: defaults exposed", L0 and L0.rec_base == 0x7B5C0 and L0.idx == 0x2134
+      and L0.buckets == 8, L0 and L0.rec_base)
+
+local applied = m.apply_layout({ stat_rec_base = "0x200000", stat_rec_stride = "0x1000" }, "test")
+check("layout: overrides applied", applied == 2 and m.layout().rec_base == 0x200000
+      and m.layout().idx == 0x1000, applied)
+
+check("layout: short field names accepted", m.apply_layout({ rec_base = 0x210000 }, "test") == 1
+      and m.layout().rec_base == 0x210000)
+
+check("layout: junk ignored",
+      m.apply_layout({ stat_rec_base = "banana", stat_rec_stride = -4 }, "test") == 0)
+check("layout: bucket count is range checked",
+      m.apply_layout({ stat_buckets = 99 }, "test") == 0
+      and m.layout().buckets == 8)
+
+m.apply_layout({ stat_rec_base = L0.rec_base, stat_rec_stride = L0.idx }, "restore")
+check("layout: restored to defaults", m.layout().rec_base == L0.rec_base
+      and m.layout().idx == L0.idx)
+
+-- calibration.txt is read by the module and wins over the compiled defaults
+-- the module's io wrapper accepts Windows separators; the harness itself runs
+-- on the host filesystem, so convert them here
+local cdir = m.state.dir and string.gsub(m.state.dir, "\\", "/") or nil
+local wrote = false
+if cdir then
+    local f = io.open(cdir .. "/calibration.txt", "w")
+    if f then
+        f:write("# test\nstat_rec_base = 0x222000\nstat_buckets = 4\n")
+        f:close()
+        wrote = true
+    end
+end
+check("calibration: file written for the test", wrote, tostring(cdir))
+local cal = m.read_calibration(cdir)
+check("calibration: keys parsed", cal and cal.stat_rec_base == "0x222000"
+      and cal.stat_buckets == "4", cal and cal.stat_rec_base)
+check("calibration: applied", m.apply_layout(cal, "calibration.txt") == 2
+      and m.layout().rec_base == 0x222000 and m.layout().buckets == 4,
+      m.layout().rec_base)
+m.apply_layout({ stat_rec_base = L0.rec_base, stat_buckets = 8 }, "restore")
+check("calibration: buckets restored", m.layout().buckets == 8)
+if cdir then os.remove(cdir .. "/calibration.txt") end
+check("calibration: missing file is not an error", m.read_calibration(cdir) == nil)
+
+-- probe: the LAYOUT and PLAYERS blocks and the dump guard
+m.probe_write("harness")
+local ptxt = nil
+if cdir then
+    local f = io.open(cdir .. "/probe.txt", "r")
+    if f then ptxt = f:read("*a"); f:close() end
+end
+check("probe: LAYOUT block written", ptxt and string.find(ptxt, "LAYOUT rec_base", 1, true) ~= nil)
+check("probe: PLAYERS block written", ptxt and string.find(ptxt, "PLAYERS side idx goals", 1, true) ~= nil)
+check("probe: dump refuses without a located region", m.probe_dump(nil) == false)
+
 return RESULTS
