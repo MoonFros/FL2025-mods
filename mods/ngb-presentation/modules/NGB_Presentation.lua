@@ -58,7 +58,7 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "2.0.1"
+m.VERSION = "2.0.2"
 m.STATE_VERSION = 4
 
 -- ============================================================================
@@ -75,7 +75,12 @@ m.STATE_VERSION = 4
 --          window but could not close it - a region can be unmapped between
 --          the map being built and the read.
 --
---   2.0.1  (this file) reads and writes go through the renderer DLL:
+--   2.0.2  get_proc() casts every export before calling it. 2.0.1 called the
+--          raw `void *` from GetProcAddress, which LuaJIT refuses
+--          ("'void' is not callable") - the module died at load on every
+--          machine and nothing was ever drawn. See CHANGELOG problem 13.
+--
+--   2.0.1  reads and writes go through the renderer DLL:
 --            NGB_Read / NGB_Write  -> ReadProcessMemory / WriteProcessMemory
 --            NGB_Query             -> VirtualQuery
 --          on our own process. ReadProcessMemory does not fault: a bad address
@@ -3910,11 +3915,36 @@ local function load_library(path)
     return h, nil
 end
 
-local function get_proc(handle, name)
+-- GetProcAddress returns a bare address (`void *`). LuaJIT cannot call a bare
+-- address: it has no idea what the prototype is, so it raises
+--     'void' is not callable
+-- the moment you try. Every function pointer therefore has to be cast to its
+-- real signature first, which is what `ctype` is for. 2.0.1 shipped without
+-- this and the DLL was never once called - the module died at load with
+-- "'void' is not callable", Sider marked it NOT activated, and nothing was
+-- ever drawn. Keep the ctype argument mandatory: a call site without one is
+-- the bug this function exists to prevent.
+local function get_proc(handle, name, ctype)
+    if type(ctype) ~= "string" or ctype == "" then
+        log_msg("BUG: get_proc(\"" .. tostring(name) .. "\") called without a signature")
+        return nil
+    end
     local fn = C.GetProcAddress(handle, name)
     if fn == nil then return nil end
-    return fn
+    if not ffi_ok then return nil end
+    return ffi.cast(ctype, fn)
 end
+
+-- The DLL's exports, with the signatures from ngb-render/src/ngb.h. One table,
+-- so the cast and the call site can never disagree.
+local PROTO = {
+    NGB_Start    = "int (*)(const char *)",
+    NGB_GetState = "const char *(*)(void)",
+    NGB_Read     = "unsigned int (*)(unsigned long long, void *, unsigned int)",
+    NGB_Write    = "unsigned int (*)(unsigned long long, const void *, unsigned int)",
+    NGB_Query    = "unsigned int (*)(unsigned long long, unsigned long long *, " ..
+                   "unsigned long long *, unsigned int *)",
+}
 
 function m.renderer_path(ctx)
     local sdir = (ctx and ctx.sider_dir) or ""
@@ -3967,7 +3997,7 @@ function m.load_renderer(ctx)
         return false
     end
 
-    local start = get_proc(handle, "NGB_Start")
+    local start = get_proc(handle, "NGB_Start", PROTO.NGB_Start)
     if not start then
         m.renderer.state = "overlay"
         m.renderer.detail = "NGB_Start export missing"
@@ -4005,13 +4035,13 @@ function m.load_renderer(ctx)
         return false
     end
 
-    local state_proc = get_proc(handle, "NGB_GetState")
+    local state_proc = get_proc(handle, "NGB_GetState", PROTO.NGB_GetState)
 
     -- the DLL is also the module's fault-free memory backend: ReadProcessMemory
     -- and VirtualQuery on our own process, neither of which can crash the game
-    m.read_proc = get_proc(handle, "NGB_Read")
-    m.write_proc = get_proc(handle, "NGB_Write")
-    m.query_proc = get_proc(handle, "NGB_Query")
+    m.read_proc = get_proc(handle, "NGB_Read", PROTO.NGB_Read)
+    m.write_proc = get_proc(handle, "NGB_Write", PROTO.NGB_Write)
+    m.query_proc = get_proc(handle, "NGB_Query", PROTO.NGB_Query)
     if m.read_proc and m.query_proc then
         MEM_BACKEND = "dll"
         mem_ok = true
@@ -4037,8 +4067,11 @@ end
 -- Returns nil when the DLL is not loaded or the export is missing.
 function m.renderer_status()
     if m.renderer.state ~= "dll" or not m.renderer.get_state then return nil end
-    local s = m.renderer.get_state()
-    if type(s) ~= "string" then return nil end
+    -- a `const char *` return is cdata, not a Lua string: convert it, and stop
+    -- if the DLL handed back NULL
+    local p = m.renderer.get_state()
+    if p == nil then return nil end
+    local s = ffi.string(p)
     local t = {}
     for k, v in string.gmatch(s, "([%w_]+)=([^;]*)") do t[k] = v end
     return t

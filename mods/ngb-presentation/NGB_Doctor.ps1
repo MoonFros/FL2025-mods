@@ -345,6 +345,39 @@ if (Test-Path $siderLog) {
         "start the game through Sider at least once"
 }
 
+# the module prints its environment once, at start-up: quote it back verbatim
+$markers = @("lua =", "luajit =", "ffi =", "memory lib =", "match lib =",
+             "folder layout:", "state file:", "renderer wanted =")
+$seen = @{}
+if ($recent -ne $null) {
+    foreach ($l in $recent) {
+        foreach ($mk in $markers) {
+            if ($l.Contains($mk)) { $seen[$mk] = $l.Trim() }
+        }
+    }
+}
+if ($seen.Count -gt 0) {
+    Emit ""
+    Emit "  environment (the module's own words from sider.log):"
+    foreach ($mk in $markers) {
+        if ($seen.ContainsKey($mk)) { Emit ("        " + $seen[$mk]) }
+    }
+}
+if ($seen.ContainsKey("match lib =")) {
+    if ($seen["match lib ="].Contains("false")) {
+        Check "Sider match library" "warn" "not exposed by this Sider build" `
+            "the score and clock come from it. Check match-stats.enabled = 1, and if your Sider ships mstats.lua, add: lua.module = `"mstats.lua`""
+    } else {
+        Check "Sider match library" "ok" "exposed" ""
+    }
+}
+if ($seen.ContainsKey("memory lib =")) {
+    if ($seen["memory lib ="].Contains("false")) {
+        Check "memory library" "warn" "missing" `
+            "this Sider build does not expose 'memory'; live player numbers cannot work"
+    }
+}
+
 if (Test-Path $dllLog) {
     Emit ""
     Emit "  ngb-dll.log (last 12 lines):"

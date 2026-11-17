@@ -766,6 +766,37 @@ hotkey_diag=0x76          (F7)
 hotkey_kill=0x7B          (F12)
 ```
 
+### Calling it from Lua: `GetProcAddress` returns a `void *`
+
+This cost a release, so it is written down where it cannot be missed.
+`C.GetProcAddress()` hands back a bare address. LuaJIT will not call it — it has
+no prototype, and a wrong guess would corrupt the stack — so it raises:
+
+```
+[string "NGB_Presentation.lua"]: 'void' is not callable
+```
+
+Every pointer must be cast first, with the exact signature from `ngb.h`:
+
+```lua
+local PROTO = {
+    NGB_Start    = "int (*)(const char *)",
+    NGB_GetState = "const char *(*)(void)",
+    NGB_Read     = "unsigned int (*)(unsigned long long, void *, unsigned int)",
+    ...
+}
+local fn = ffi.cast(PROTO[name], C.GetProcAddress(handle, name))
+```
+
+`get_proc()` in the module does this and refuses to run without a signature;
+`tools/verify_mod.py` fails the build if a call site omits one. `NGB_GetState`
+additionally needs `ffi.string()`: a `const char *` return is **cdata**, not a
+Lua string, so `type(s) == "string"` is false until it is converted.
+
+`tools/ffi_loader_test.lua` covers all of this with a fake FFI in which an
+uncast address raises the same error the game reported, so the mistake cannot
+return unnoticed.
+
 ### Exported API
 
 | Export | Signature | Purpose |

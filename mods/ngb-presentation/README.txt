@@ -2,7 +2,7 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.1
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.2
 
   First time? INSTALL.txt in this folder explains the same thing in plain
   English, step by step, including the sider.ini lines.
@@ -444,6 +444,13 @@ and nothing is filled with zeros to look complete.
 11. CHANGES
 --------------------------------------------------------------------------------
 
+  2.0.2  THE FIX THAT MAKES THE RENDERER ACTUALLY WORK. 2.0.0 and 2.0.1
+         called the DLL's functions through raw pointers from
+         GetProcAddress, which LuaJIT refuses ("'void' is not callable"), so
+         the module stopped at start-up and nothing was ever drawn. Every
+         export is now cast to its real signature first. If you saw
+         "Module is NOT activated" in sider.log, this is the version that
+         fixes it.
   2.0.1  Memory reads go through the DLL. Sider's memory library reads an
          address by dereferencing it, so a single stale pointer could end the
          game; ReadProcessMemory cannot. Without the DLL, live player numbers
