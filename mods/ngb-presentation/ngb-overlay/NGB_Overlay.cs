@@ -119,6 +119,23 @@ namespace Ngbfc.Presentation
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+        [DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
+
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassName(IntPtr hWnd, StringBuilder buf, int max);
+
+        [DllImport("user32.dll")]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+
+        // Diagnostic helper: is a module with this name loaded in the process?
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr GetModuleHandle(string name);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int pid);
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
@@ -359,6 +376,12 @@ namespace Ngbfc.Presentation
         public string NamesSource = "";
         public int EventCount;
         public string Clock = "";
+        // problem 3: written by the Lua module from *inside* the game
+        public int GamePid;
+        public string GameExe = "";
+        public string GameHwnd = "";
+        public string Backbuffer = "";
+        public string RendererState = "";
         public TeamState Home = new TeamState(), Away = new TeamState();
         public HudEvent Event;
         public ToastState Toast;
@@ -446,6 +469,17 @@ namespace Ngbfc.Presentation
                 st.DataScore = S(data, "scoreboard", "none");
             }
             st.OverlayVisible = B(status, "overlay_visible", false);
+
+            var game = D(root, "game");
+            if (game != null)
+            {
+                st.GamePid = I(game, "pid", 0);
+                st.GameExe = S(game, "exe", "");
+                st.GameHwnd = S(game, "hwnd", "");
+                st.Backbuffer = S(game, "backbuffer", "");
+            }
+            var diag = D(root, "diag");
+            if (diag != null) st.RendererState = S(diag, "renderer", "");
 
             var match = D(root, "match");
             st.Clock = S(match, "clock", "");
@@ -1151,120 +1185,214 @@ namespace Ngbfc.Presentation
         }
 
         // ---------------------------------------------------------------------
-        //  Target window
+        //  Target window  (problems 1, 2 and 3)
         //
-        //  Two strategies, in this order:
-        //   1. a process we know by name (FL_2025 / FL2025 / PES2021 ...)
-        //   2. whatever window currently has focus, as long as it is a real
-        //      application window of another process and is at least 640x360
+        //  How this used to work: try a list of guessed exe names, then fall
+        //  back to "the focused window of any other process that is at least
+        //  640x360". That fallback could attach the overlay to a browser or the
+        //  desktop, and ComputeGameRect() additionally required the game to be
+        //  the FOREGROUND window - so an unfocused (windowed) game drew nothing.
+        //  Both rules are gone.
         //
-        //  Strategy 2 exists because a wrong process name, or a game whose
-        //  Process.MainWindowHandle stays zero, used to mean the overlay drew
-        //  nothing at all - and silently, because every draw path hung off the
-        //  same "do we know the game window" test.
+        //  New rules, in order, and none of them is a guess:
+        //   1. the PID the Lua module writes into state.json
+        //      (read from inside the game with GetCurrentProcessId)
+        //   2. the exe name the Lua module writes into state.json
+        //   3. a process that has sider.dll loaded (the mod loader only ever
+        //      runs inside the game)
+        //  If none of those produce a visible window we do NOT attach: cards
+        //  need a game window, and drawing on an unrelated window is worse
+        //  than drawing nothing. Diagnostics still fall back to the screen.
         // ---------------------------------------------------------------------
-        private string _targetDesc = "";
-        private bool _targetIsGame;
+        private string _targetDesc = "not resolved yet";
+        private string _targetWhy = "";
         private bool _screenMode;
+        private IntPtr _lastKnownGame = IntPtr.Zero;
 
-        private static readonly string[] KNOWN_GAMES =
-            { "FL_2025", "FL2025", "FL25", "PES2021", "PES2021_x64", "FootballLife2025" };
+        /// <summary>Largest visible top-level window owned by <paramref name="pid"/>.</summary>
+        private IntPtr WindowForPid(int pid)
+        {
+            IntPtr best = IntPtr.Zero;
+            long bestArea = 0;
+            try
+            {
+                Native.EnumWindows(delegate(IntPtr h, IntPtr lp)
+                {
+                    int wpid;
+                    Native.GetWindowThreadProcessId(h, out wpid);
+                    if (wpid != pid) return true;
+                    if (!Native.IsWindowVisible(h) || Native.IsIconic(h)) return true;
+                    var cls = new StringBuilder(64);
+                    Native.GetClassName(h, cls, 64);
+                    string cn = cls.ToString();
+                    if (cn == "IME" || cn == "MSCTFIME UI" || cn == "ConsoleWindowClass")
+                        return true;
+                    Native.RECT cr;
+                    if (!Native.GetClientRect(h, out cr)) return true;
+                    long area = (long)(cr.Right - cr.Left) * (cr.Bottom - cr.Top);
+                    if (area > bestArea) { bestArea = area; best = h; }
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return best;
+        }
+
+        private static string ProcNameOf(int pid)
+        {
+            try { return Process.GetProcessById(pid).ProcessName; }
+            catch { return ""; }
+        }
+
+        private static bool ProcessHasSider(int pid)
+        {
+            try
+            {
+                using (var p = Process.GetProcessById(pid))
+                {
+                    foreach (ProcessModule mod in p.Modules)
+                    {
+                        string n = mod.ModuleName;
+                        if (string.Equals(n, "sider.dll", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                }
+            }
+            catch
+            {
+                // cross-bitness or protected process: we cannot inspect it, which
+                // means we also cannot use it as evidence. Say nothing.
+            }
+            return false;
+        }
 
         private void ProbeGameWindow()
         {
             double now = _clock.Elapsed.TotalSeconds;
-            if (_gameHwnd != IntPtr.Zero && Native.IsWindow(_gameHwnd) &&
-                Native.IsWindowVisible(_gameHwnd) && (now - _lastProbe) < 1.0)
+            if (_gameHwnd != IntPtr.Zero && Native.IsWindow(_gameHwnd) && (now - _lastProbe) < 1.0)
                 return;
-            if ((now - _lastProbe) < 1.0 && _gameHwnd != IntPtr.Zero) return;
+            if ((now - _lastProbe) < 1.0) return;
             _lastProbe = now;
 
             IntPtr found = IntPtr.Zero;
             int foundPid = 0;
             string desc = "";
-            bool isGame = false;
+            string why = "";
 
-            Process[] procs = null;
-            try { procs = Process.GetProcesses(); } catch { }
-            if (procs != null)
+            // --- 1. PID from state.json ---------------------------------------
+            HudState st = _state;
+            int statePid = st != null ? st.GamePid : 0;
+            if (statePid > 0)
             {
-                foreach (var want in KNOWN_GAMES)
+                found = WindowForPid(statePid);
+                if (found != IntPtr.Zero)
+                {
+                    foundPid = statePid;
+                    desc = string.Format("pid {0} ({1}.exe)", statePid, ProcNameOf(statePid));
+                    why = "pid from state.json";
+                }
+            }
+
+            // --- 2. exe name from state.json ----------------------------------
+            if (found == IntPtr.Zero && st != null && !string.IsNullOrEmpty(st.GameExe))
+            {
+                string want = st.GameExe;
+                if (want.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                    want = want.Substring(0, want.Length - 4);
+                Process[] procs = null;
+                try { procs = Process.GetProcessesByName(want); } catch { }
+                if (procs != null)
+                {
+                    foreach (var p in procs)
+                    {
+                        IntPtr h;
+                        try { h = WindowForPid(p.Id); } catch { continue; }
+                        if (h != IntPtr.Zero) { found = h; foundPid = p.Id; break; }
+                        try { p.Dispose(); } catch { }
+                    }
+                    if (found != IntPtr.Zero)
+                    {
+                        desc = string.Format("pid {0} ({1}.exe)", foundPid, want);
+                        why = "exe name from state.json";
+                    }
+                }
+            }
+
+            // --- 3. whatever loaded sider.dll ---------------------------------
+            if (found == IntPtr.Zero)
+            {
+                Process[] procs = null;
+                try { procs = Process.GetProcesses(); } catch { }
+                if (procs != null)
                 {
                     foreach (var p in procs)
                     {
                         try
                         {
-                            if (!string.Equals(p.ProcessName, want, StringComparison.OrdinalIgnoreCase))
-                                continue;
-                            IntPtr h = p.MainWindowHandle;
-                            if (h == IntPtr.Zero || !Native.IsWindowVisible(h)) continue;
+                            if (p.Id == Process.GetCurrentProcess().Id) continue;
+                            if (p.MainWindowHandle == IntPtr.Zero) continue;
+                            if (!ProcessHasSider(p.Id)) continue;
+                            IntPtr h = WindowForPid(p.Id);
+                            if (h == IntPtr.Zero) continue;
                             found = h;
                             foundPid = p.Id;
-                            desc = string.Format("game process {0}.exe", p.ProcessName);
-                            isGame = true;
+                            desc = string.Format("pid {0} ({1}.exe, has sider.dll)", p.Id, p.ProcessName);
+                            why = "sider.dll loaded";
                             break;
                         }
                         catch { }
                     }
-                    if (found != IntPtr.Zero) break;
                 }
             }
 
-            if (found == IntPtr.Zero)
+            if (found == IntPtr.Zero && _lastKnownGame != IntPtr.Zero &&
+                Native.IsWindow(_lastKnownGame) && Native.IsWindowVisible(_lastKnownGame))
             {
-                // fallback: the focused window of another process
-                IntPtr fg = Native.GetForegroundWindow();
-                if (fg != IntPtr.Zero)
-                {
-                    int fgPid;
-                    Native.GetWindowThreadProcessId(fg, out fgPid);
-                    if (fgPid != 0 && fgPid != Process.GetCurrentProcess().Id)
-                    {
-                        Native.RECT cr;
-                        if (Native.IsWindowVisible(fg) && Native.GetClientRect(fg, out cr))
-                        {
-                            int cw = cr.Right - cr.Left, ch = cr.Bottom - cr.Top;
-                            if (cw >= 640 && ch >= 360)
-                            {
-                                found = fg;
-                                foundPid = fgPid;
-                                string pname = "pid " + fgPid;
-                                try { pname = Process.GetProcessById(fgPid).ProcessName; } catch { }
-                                desc = string.Format("focused window of {0}.exe (not a known game name)", pname);
-                            }
-                        }
-                    }
-                }
+                // the game window still exists, we just could not re-resolve it
+                found = _lastKnownGame;
+                why = "previous window";
+                desc = _targetDesc;
             }
+
+            if (found != IntPtr.Zero && Native.IsWindowVisible(found)) _lastKnownGame = found;
 
             if (found != _gameHwnd || foundPid != _gamePid)
             {
                 _gameHwnd = found;
                 _gamePid = foundPid;
-                _targetIsGame = isGame;
-                _targetDesc = found == IntPtr.Zero ? "no window found" : desc;
-                Log("target: " + _targetDesc);
+                _targetWhy = why;
+                if (found == IntPtr.Zero)
+                {
+                    _targetDesc = "no game window";
+                    Log("target: no game window yet (waited for state.json pid / exe / sider.dll)");
+                }
+                else
+                {
+                    _targetDesc = desc;
+                    Log("target: " + desc + "  [" + why + "]");
+                }
             }
         }
 
         private bool ComputeGameRect()
         {
             if (_gameHwnd == IntPtr.Zero) return false;
-            if (Native.IsIconic(_gameHwnd) || !Native.IsWindowVisible(_gameHwnd)) return false;
 
-            IntPtr fg = Native.GetForegroundWindow();
-            if (fg != IntPtr.Zero && _gamePid != 0)
-            {
-                int fgPid;
-                Native.GetWindowThreadProcessId(fg, out fgPid);
-                if (fgPid != _gamePid) return false;
-            }
+            // Problem 1: this used to also require the game to be the foreground
+            // window. For a deliberately unfocused windowed game that meant the
+            // overlay never drew anything at all. Visibility and "not minimised"
+            // are the only conditions now: an unfocused window is still a window
+            // the player can see, and that is all a card needs.
+            if (Native.IsIconic(_gameHwnd)) return false;
+            if (!Native.IsWindowVisible(_gameHwnd)) return false;
 
             Native.RECT cr;
             if (!Native.GetClientRect(_gameHwnd, out cr)) return false;
             var tl = new Native.POINT(0, 0);
             if (!Native.ClientToScreen(_gameHwnd, ref tl)) return false;
 
+            // the client rect is the truth (no borders, no title bar); a card is
+            // laid out from these numbers only, never from a hard-coded 1920x1080
             int w = cr.Right - cr.Left;
             int h = cr.Bottom - cr.Top;
             if (w < 320 || h < 200) return false;
@@ -2230,7 +2358,11 @@ namespace Ngbfc.Presentation
                 {
                     "target       :  " + target,
                     "drawn on     :  " + (_screenMode ? "primary screen (no window)" :
-                                          (_winW + "x" + _winH + (_targetIsGame ? " game" : " window"))),
+                                          (_winW + "x" + _winH + " client rect")),
+                    "attached via :  " + (_targetWhy == "" ? "n/a" : _targetWhy),
+                    "game pid     :  " + (_gamePid == 0 ? "unknown" :
+                                          (_gamePid + (st != null && st.Backbuffer != "" ?
+                                           "   backbuffer " + st.Backbuffer : ""))),
                     "state file   :  " + age + "   " + ShortPath(_statePath),
                 };
 
@@ -2467,7 +2599,7 @@ namespace Ngbfc.Presentation
         [STAThread]
         private static void Main(string[] args)
         {
-            try { Native.SetProcessDPIAware(); } catch { }
+            EnableBestDpiAwareness();
             try { Native.SetCurrentProcessExplicitAppUserModelID("MoonFros.NGB.Presentation"); }
             catch { }
 
@@ -2492,6 +2624,37 @@ namespace Ngbfc.Presentation
                 Application.Run(new OverlayForm(state));
                 GC.KeepAlive(mutex);
             }
+        }
+
+        /// <summary>
+        /// Per-monitor DPI awareness, in descending order of quality. A DPI
+        /// unaware process gets its coordinates virtualised by Windows: the
+        /// overlay would be scaled by the system and the cards would land in the
+        /// wrong place on a 125%/150% display. Each step is tried and logged;
+        /// the last one always works on Vista+.
+        /// </summary>
+        private static void EnableBestDpiAwareness()
+        {
+            // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4
+            try
+            {
+                if (Native.SetProcessDpiAwarenessContext(new IntPtr(-4)))
+                { Log("dpi: per-monitor v2"); return; }
+            }
+            catch { }
+            try
+            {
+                // PROCESS_PER_MONITOR_DPI_AWARE == 2 (Windows 8.1+)
+                if (Native.SetProcessDpiAwareness(2) == 0)
+                { Log("dpi: per-monitor v1"); return; }
+            }
+            catch { }
+            try
+            {
+                if (Native.SetProcessDPIAware()) { Log("dpi: system aware"); return; }
+            }
+            catch { }
+            Log("dpi: unaware (scaled by Windows - cards may be misplaced)");
         }
 
         private static string LocateStateFile(string[] args)

@@ -7,8 +7,9 @@ rem ===========================================================================
 rem  NEXT-GEN FOOTBALL BROADCAST PRESENTATION  -  installer
 rem  MOONFROS PRESENTS  -  created by MoonFros
 rem
-rem  Copies the mod into a Sider folder, registers it in sider.ini (adding two
-rem  lines, never rewriting anything else), builds the overlay and starts it.
+rem  Copies the mod into a Sider folder, installs the renderer DLL and
+rem  registers the module in sider.ini (adding three lines, never rewriting
+rem  anything else). Nothing is compiled and no extra window is started.
 rem
 rem  Usage:  double-click, drag your Sider folder onto this file, or
 rem          install.bat "D:\Games\Football Life 2025\Sider"
@@ -110,19 +111,47 @@ if exist "%SIDER%\content\ngb-presentation" (
 echo  modules\NGB_Presentation.lua + .ini      installed
 >> "%LOG%" echo copied modules
 
+rem ---------------------------------------------------------------------------
+rem  3. the renderer (this is what actually draws the cards)
+rem ---------------------------------------------------------------------------
+rem  NGB_Render.dll is a prebuilt 64-bit DLL that is loaded into the GAME
+rem  process by the Lua module. It draws inside the game's own frame, so it
+rem  works in windowed, borderless and exclusive fullscreen, focused or not.
+rem  Nothing is compiled here: no Visual Studio, no compiler, no downloads.
+rem ---------------------------------------------------------------------------
+set "DLL_OK=0"
+if exist "%HERE%\ngb-render\NGB_Render.dll" (
+    if not exist "%SIDER%\ngb-render" mkdir "%SIDER%\ngb-render" >nul 2>&1
+    copy /y "%HERE%\ngb-render\NGB_Render.dll" "%SIDER%\ngb-render\" >nul
+    if errorlevel 1 (
+        echo  [!] Could not copy NGB_Render.dll - is the folder read-only?
+        >> "%LOG%" echo DLL copy failed
+    ) else (
+        set "DLL_OK=1"
+        echo  ngb-render\NGB_Render.dll                installed
+        >> "%LOG%" echo copied NGB_Render.dll
+    )
+) else (
+    echo  [!] ngb-render\NGB_Render.dll is missing from this package.
+    >> "%LOG%" echo DLL missing from package
+)
+
+rem ---- optional fallback: the C# overlay (only if the user already built it)
 for %%I in ("%HERE%\ngb-overlay") do set "OSRC=%%~fI"
 for %%I in ("%SIDER%\ngb-overlay") do set "ODST=%%~fI"
 if /i "%OSRC%"=="%ODST%" (
     echo  ngb-overlay\                            already in place
-) else (
+) else if exist "%HERE%\ngb-overlay\NGB_Overlay.cs" (
     xcopy "%HERE%\ngb-overlay\*.*" "%SIDER%\ngb-overlay\" /E /I /Y /Q >nul
-    echo  ngb-overlay\                            installed
-    >> "%LOG%" echo copied ngb-overlay
+    echo  ngb-overlay\ (fallback)                installed
+    >> "%LOG%" echo copied ngb-overlay fallback
 )
-> "%SIDER%\ngb-overlay\install_info.txt" echo Installed by MoonFros Next-Gen Broadcast
->> "%SIDER%\ngb-overlay\install_info.txt" echo Sider folder: %SIDER%
->> "%SIDER%\ngb-overlay\install_info.txt" echo Date: %DATE% %TIME%
->> "%SIDER%\ngb-overlay\install_info.txt" echo Remove with uninstall.bat (or delete this folder).
+if exist "%SIDER%\ngb-overlay" (
+    > "%SIDER%\ngb-overlay\install_info.txt" echo Installed by MoonFros Next-Gen Broadcast
+    >> "%SIDER%\ngb-overlay\install_info.txt" echo Sider folder: %SIDER%
+    >> "%SIDER%\ngb-overlay\install_info.txt" echo Date: %DATE% %TIME%
+    >> "%SIDER%\ngb-overlay\install_info.txt" echo Optional fallback renderer. The normal renderer is ngb-render\NGB_Render.dll.
+)
 
 rem ---------------------------------------------------------------------------
 rem  3. register the module in sider.ini
@@ -171,17 +200,25 @@ echo  sider.ini : updated by hand
 >> "%LOG%" echo sider.ini configured
 
 rem ---------------------------------------------------------------------------
-rem  4. build + start the overlay
+rem  4. verification (no compiler, no second window)
 rem ---------------------------------------------------------------------------
-echo.
-set "BUILD=ok"
-if exist "%SIDER%\ngb-overlay\Start_NGB_Overlay.bat" (
-    call "%SIDER%\ngb-overlay\Start_NGB_Overlay.bat"
-    if errorlevel 1 set "BUILD=failed"
-) else (
-    set "BUILD=missing"
+if /i not "%DLL_OK%"=="1" (
+    echo.
+    echo  ==================================================================
+    echo   INSTALL INCOMPLETE  - the renderer DLL is missing
+    echo.
+    echo   modules\ and sider.ini are done, so the mod is registered, but
+    echo   without ngb-render\NGB_Render.dll nothing can be drawn.
+    echo   Re-download the package; ngb-render\NGB_Render.dll must sit next
+    echo   to install.bat. Nothing has to be uninstalled first.
+    echo  ==================================================================
+    >> "%LOG%" echo INSTALL INCOMPLETE - no DLL
+    echo.
+    pause
+    exit /b 1
 )
-if /i not "%BUILD%"=="ok" goto build_failed
+echo  renderer                                 NGB_Render.dll (in-game, D3D11)
+>> "%LOG%" echo renderer: NGB_Render.dll
 
 rem ---------------------------------------------------------------------------
 rem  5. done
@@ -190,14 +227,24 @@ echo.
 echo ==================================================================
 echo   INSTALLATION COMPLETE  -  MOONFROS PRESENTS
 echo.
-echo   Start Football Life in BORDERLESS or WINDOWED mode.
+echo   Start Football Life as usual - windowed, borderless or fullscreen.
+echo   The cards are drawn inside the game's own frame, so they stay up even
+echo   when the game window is not focused (click the desktop: they remain).
 echo.
 echo   In game:   [7] presentation style   [8] presentation on / off
 echo              [9] shot analysis on / off
-echo   Overlay:   F10 demo   F11 diagnostics   F12 quit
+echo   Renderer:  F8 self-test card   F7 diagnostics   F12 cards on / off
 echo.
-echo   Cards: goals (spotlight + shot analysis), shots and saves,
-echo          brace / hat-trick milestones, full-time Man of the Match.
+echo   Cards: goals (real scorer, minute and score), shots and saves,
+echo          brace / hat-trick milestones, half-time and full-time,
+echo          Man of the Match.
+echo.
+echo   Logs if something is not showing:
+echo     %SIDER%\sider.log                     (module, prefixed [NGB])
+echo     %SIDER%\content\ngb-presentation\ngb-dll.log    (renderer)
+echo     %SIDER%\content\ngb-presentation\heartbeat.txt  (module alive, 1/s)
+echo     %SIDER%\content\ngb-presentation\render.txt     (renderer alive, 1/s)
+echo     %SIDER%\content\ngb-presentation\state.json     (what the HUD was told)
 echo.
 echo   Uninstall: run uninstall.bat from this folder.
 echo ==================================================================
@@ -207,20 +254,10 @@ exit /b 0
 
 :build_failed
 echo.
-echo ==================================================================
-echo   INSTALL INCOMPLETE  -  the overlay did not compile
-echo.
-echo   The Sider module is registered and sider.ini is configured, so the
-echo   game side is fine. Only the graphic overlay is missing.
-echo.
-echo   Scroll up for the compiler messages (they start with "error CS").
-echo   Nothing above has to be deleted: fix or report the error, then run
-echo   install.bat again.
-echo.
-echo   The Sider overlay will read:  OVERLAY NOT RUNNING
-echo   Log: %LOG%
-echo ==================================================================
->> "%LOG%" echo INSTALL INCOMPLETE - overlay build failed
+echo  ==================================================================
+echo   INSTALL INCOMPLETE
+echo  ==================================================================
+>> "%LOG%" echo INSTALL INCOMPLETE
 echo.
 pause
 exit /b 1

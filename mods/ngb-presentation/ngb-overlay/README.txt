@@ -40,7 +40,7 @@ Window targeting
 One instance only: a second copy logs "already running" and exits.
 
 You only need Start_NGB_Overlay.bat once. The Lua module starts the overlay
-itself every time the game starts (auto_launch_companion = 1), so the .bat is a
+itself every time the game starts (renderer = overlay), so the .bat is a
 first-time/repair tool, not a step in your routine.
 
 Nothing appears? The overlay writes NGB_Overlay.log next to the exe, and for the

@@ -2,32 +2,42 @@
   NEXT-GEN FOOTBALL BROADCAST PRESENTATION
   MOONFROS PRESENTS
   Created by MoonFros
-  For Football Life 2025 / PES 2021  -  Sider 7  -  version 1.3.1
+  For Football Life 2025 / PES 2021  -  Sider 7  -  version 2.0.1
+
+  First time? INSTALL.txt in this folder explains the same thing in plain
+  English, step by step, including the sider.ini lines.
 ================================================================================
 
 A broadcast presentation layer for Football Life 2025: goal cards with the real
-scorer and minute, half-time and full-time score cards, a slim live score bug
-and milestone call-outs, drawn over the game by a transparent click-through
-overlay.
+scorer and minute, half-time and full-time score cards, a slim live score bug,
+shot analysis and milestone call-outs.
 
-Everything on screen comes from Sider's own match library and goal hook, which
-read the game directly. Nothing is guessed, and nothing is filled with zeros.
+2.0 changed HOW it is drawn. There is no second window any more. A small DLL
+(ngb-render\NGB_Render.dll) is loaded into the game process by the module and
+draws the cards inside the game's own frame, during Present. That is why it now
+works in windowed, borderless AND exclusive fullscreen, and why it keeps working
+when the game is NOT focused - which is how you play:
 
-1.3.0 fixes the two things that made the mod look broken: the overlay could not
-find the game window unless the process was called exactly FL_2025 / PES2021
-(now it falls back to the focused window, and F11 always draws), and one goal
-could produce two cards because the scoreboard updates seconds after Sider's
-hook (goals are now counted, not timed). There is also a heartbeat file, so the
-mod can tell you whether the overlay is running at all.
+    "I play windowed and deliberately click the desktop so the game is not
+     focused, because the game runs faster unfocused."
 
-1.2.0 added the calibration toolchain (section 6) and labelled the F10 demo
-cards as sample data, so you can watch every animation on your own PC.
+    That case is now the normal case. Nothing in the renderer looks at which
+    window has focus.
 
-1.1.0 was a rewrite of the data layer: the previous version tried to find the
-per-player statistics table by scanning memory with guessed offsets, which
-produced the famous "0 shots, 0 minutes, id #0" cards on builds where those
-offsets were wrong. That is gone. See section 6 for exactly what is measured,
-what is modelled and what is switched off until it is calibrated.
+Everything on screen still comes from the game: Sider's match library, the goal
+hook, and the scoreboard. Nothing is guessed, and nothing is filled with zeros.
+
+2.0 fixes the ten reported problems (see CHANGELOG.md for the individual
+verdicts): the focus rule, the wrong-window fallback, the guessed exe names, the
+unverified event names, the Sider version assumptions, the circular tests, the
+unproven stat offsets ("0 shots, 2 goals"), the FFI/Win32 risk, the uninstall
+script bug, and the fact that a separate window cannot draw over exclusive
+fullscreen.
+
+WHAT IS STILL UNVERIFIED: anything that needs Football Life running. The event
+names, the memory reads, exclusive fullscreen with the DLL and every visual are
+marked UNVERIFIED in CHANGELOG.md until you have run them. Section 8 tells you
+which file to read when something does not show.
 
 
 --------------------------------------------------------------------------------
@@ -72,10 +82,12 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
   * match-stats.enabled = 1 in sider.ini  -  install.bat adds this too.
     Sider's match library is what reports the live score and clock; without the
     line the mod can only see goals from its hook, with no score and no minute.
-  * Windows 10 or 11, 64-bit. Nothing else to download: the overlay is compiled
-    on your PC by the C# compiler that ships with .NET Framework 4.x.
-  * Play WINDOWED or BORDERLESS fullscreen. Exclusive fullscreen cannot show any
-    overlay - that is a Windows limitation, not a mod bug.
+  * Windows 10 or 11, 64-bit. Nothing to download and nothing to compile: the
+    renderer ships as a prebuilt x64 DLL (ngb-render\NGB_Render.dll).
+  * Any display mode: windowed, borderless or exclusive fullscreen. The cards
+    are drawn inside the game's own frame, so all three work. (The optional C#
+    fallback still cannot draw over exclusive fullscreen - that is the Windows
+    limitation the DLL exists to remove.)
 
 
 --------------------------------------------------------------------------------
@@ -91,7 +103,8 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
      the black window and press Enter.  install.bat then:
 
         - copies modules\NGB_Presentation.lua and .ini into <Sider>\modules\
-        - copies ngb-overlay\ into <Sider>\ngb-overlay\
+        - copies ngb-render\ into <Sider>\ngb-render\   (the renderer DLL)
+        - copies ngb-overlay\ into <Sider>\ngb-overlay\ (optional fallback)
         - adds these three lines to sider.ini, next to your other lua.modules,
           after writing a backup (sider.ini.ngb.bak):
 
@@ -99,7 +112,10 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
               match-stats.enabled = 1
               lua.module = "NGB_Presentation.lua"
 
-        - compiles and starts the overlay, then shows a confirmation.
+        - checks that the renderer landed, then shows where every log is.
+
+     Nothing is compiled. If you see the old "error CS..." message you are
+     running a 1.x copy of this folder.
 
      No other file in your Sider folder is modified. If another mod already set
      luajit.ext.enabled = 1, nothing is added twice; if it was set to 0 it is
@@ -107,13 +123,10 @@ procedurally by the overlay, so the package stays tiny and stays sharp at 720p,
 
   3. Start the game. That's it.
 
-  Manual install (if you ever need it): copy the two folders into your Sider
-  folder, add the three lines above to sider.ini, then run
-  ngb-overlay\Start_NGB_Overlay.bat once.
-
-  The .bat is only a launcher: it compiles NGB_Overlay.exe the first time and
-  starts it. After that the Lua module starts the overlay itself whenever the
-  game starts (auto_launch_companion = 1), so you never need the .bat again.
+  Manual install (if you ever need it): copy modules\, ngb-render\ (and, only
+  if you want the fallback, ngb-overlay\) into your Sider folder and add the
+  three lines above to sider.ini. Nothing has to be started by hand: the module
+  loads ngb-render\NGB_Render.dll into the game itself at startup.
 
 
 --------------------------------------------------------------------------------
@@ -139,11 +152,19 @@ IN GAME (handled by the Lua module):
   always states the current state:
         PRESENTATION ON   STYLE FULL   ANALYSIS ON
 
-OVERLAY WINDOW (only when you want to check it):
+RENDERER (handled by NGB_Render.dll, works even when the game is not focused):
 
-  F10   cycle a demo card (goal -> shot -> MOTM -> off)
-  F11   diagnostics panel (regions, style, units, state file)
-  F12   quit the overlay
+  F8    SELF-TEST: draws a card stamped "DEMO - NOT REAL DATA" through the real
+        render path. If this appears, the renderer works and the problem is
+        data, not drawing. This is the single most useful key in the mod.
+  F7    diagnostics strip: back buffer size, state file age, frames drawn,
+        kill-switch state, fault count, log path
+  F12   kill switch: cards ON / OFF without restarting the game
+        (the same switch as dll_enabled = 0 in the ini, applied at runtime)
+
+C# FALLBACK WINDOW (only if renderer = overlay):
+
+  F10   cycle a demo card    F11   diagnostics panel    F12   quit
 
 
 --------------------------------------------------------------------------------
@@ -168,6 +189,27 @@ OVERLAY WINDOW (only when you want to check it):
   position_poll_ms         how often player positions are sampled
   hotkey_*                 the three in-game keys
   debug_log                extra detail in sider.log
+
+  RENDERER
+
+  renderer                 dll (default) / overlay (C# fallback) / none
+  dll_enabled              1 = cards on, 0 = the DLL is never even hooked.
+                           The same switch as F12 at runtime.
+  dll_selftest_hotkey      default 0x77 = F8, draws the DEMO card
+  dll_diag_hotkey          default 0x76 = F7, diagnostics strip
+  dll_kill_hotkey          default 0x7B = F12, cards on / off
+  state_write_hz           how often state.json is published (1-30, default 10)
+  experimental_player_stats  0 = per-player numbers off (see section 6)
+
+  allow_unsafe_memory_reads  0 (default) = memory is read only through the
+                           renderer DLL, which cannot crash the game.
+                           1 = also allow Sider's raw memory library when the
+                           DLL is not in use. That library dereferences
+                           addresses directly, so one wrong address is a
+                           crashed game. Do not set this to 1 unless you have
+                           a reason to: without the DLL, live player numbers
+                           are simply switched off, and the score, clock and
+                           goal cards still work.
 
 
 --------------------------------------------------------------------------------
@@ -250,7 +292,9 @@ and nothing is filled with zeros to look complete.
     textures, models, .bin data. The game's scoreboards are static textures and
     cannot be animated from live data. Every animated live graphic in this mod
     comes from the overlay process, which is why it exists.
-  * Exclusive fullscreen cannot show overlays. Use borderless or windowed.
+  * The C# fallback window cannot appear over exclusive fullscreen (Windows
+    limitation). The default renderer - the DLL - can, because it draws inside
+    the game's own frame.
   * The replay camera is moved by patching the game's own replay camera
     constants during goal replays. If a future build moves them, the mod detects
     it and leaves the camera alone instead of guessing.
@@ -260,83 +304,106 @@ and nothing is filled with zeros to look complete.
  8. TROUBLESHOOTING
 --------------------------------------------------------------------------------
 
-  Nothing appears in the game  (check in this order)
-    1. Is the companion running? Open the Sider overlay (its key while playing).
-       One line reads either
-           OVERLAY   running 1.3.0   (cards draw over the game)
-       or
-           OVERLAY   NOT RUNNING  ->  run ngb-overlay\Start_NGB_Overlay.bat
-       The same answer is in content\ngb-presentation\overlay_alive.txt: the
-       companion rewrites it every two seconds.
-    2. Press F11 in game. The diagnostics panel now draws even when no game
-       window is recognised, and its first two lines are
-           target       :  game process FL_2025.exe   (or "focused window of ...")
-           drawn on     :  1920x1080 game              (or "primary screen")
-       If it says "no window found", the overlay is alive but could not see the
-       game - the panel still tells you so instead of staying invisible.
-    3. Read <Sider>\ngb-overlay\NGB_Overlay.log. It logs the target window, the
-       state file it watches, and whether the file exists.
-    4. Borderless or windowed only. In exclusive fullscreen a layered window is
-       not composited and nothing can appear.
-    5. Windows 7/8 compat mode, or an antivirus blocking a new exe, also stops
-       the window from showing; the log records the start-up line either way.
+  WHY NOTHING SHOWS  (check in this order)
 
-  Cards appear but the score and clock are 0
-    - match-stats.enabled = 1 is missing from sider.ini. The mod says so in the
-      Sider overlay ("ENGINE OFF -> add match-stats.enabled = 1") and in
-      sider.log. Add the line, restart the game.
+    0. PRESS F8 FIRST.
+       A card stamped "DEMO - NOT REAL DATA" appears
+            -> the renderer works. The problem is data, not drawing. Go to 3.
+       Nothing appears
+            -> the renderer is not running. Go to 1.
 
-  A goal shows the team but no player name
-    - The goal hook did not fire for that goal (the scoreboard reported it
-      instead). The card is deliberately unnamed rather than guessing.
-    - If it happens for every goal, check that luajit.ext.enabled = 1 is in
-      sider.ini and that you are on Sider 7.3 or newer.
+    1. Is the DLL loaded?
+       <Sider>\content\ngb-presentation\ngb-dll.log   (and render.txt)
 
-  Shots / assists / ratings show nothing
-    - That is tier 2 (section 6): the per-player table is not calibrated for
-      your exe build. Follow "calibration in one file" in section 6: set the
-      three keys, play until a goal, then run tools\decode_probe.py on
-      probe_region.bin. Until the table validates, the cards stay clean instead
-      of printing zeros.
+         no ngb-dll.log at all ......... the module never tried to load the DLL.
+                                         Read sider.log for the [NGB] line
+                                         "renderer: NO DLL at ..." or
+                                         "renderer: disabled by configuration".
+         "NO DLL at ..." ............... wrong folder. Re-run install.bat; the
+                                         file belongs in <Sider>\ngb-render\.
+         "ffi off" ..................... add luajit.ext.enabled = 1 to sider.ini.
+         "LoadLibraryA failed" ......... wrong/32-bit file, or blocked by AV.
+         "hooks installed: Present=..." the renderer is live. If F8 still shows
+                                         nothing, send me this file.
+         "FATAL: exception 0x... " ..... the renderer caught its own fault and
+                                         switched itself off. The game keeps
+                                         running. Send me that line.
 
-  "error CS..." when running install.bat
-    - The overlay did not compile, so install.bat now stops with
-      INSTALL INCOMPLETE. The Sider module is still installed. Copy the error
-      lines into a message - that is the fastest way to get a fix.
-    - If an older NGB_Overlay.exe exists, the start script warns that it is
-      running an old build; delete ngb-overlay\NGB_Overlay.exe to be sure.
+    2. Is the module alive?
+       <Sider>\content\ngb-presentation\heartbeat.txt is rewritten every second.
 
-  The Sider overlay says "OVERLAY STALE x.y.z"
-    - The exe on disk is older than the module. Run install.bat again (it
-      rebuilds it); if the build fails, the compiler message tells you why.
+         ticks=0 ....................... the module never ticked: display_frame
+                                         is not firing AND the Sider overlay was
+                                         never opened. sider.log will show each
+                                         ctx.register line and "event 'x' fired
+                                         for the first time" when one works.
+         tick_source=display_frame ..... good, the per-frame event works.
+         tick_source=overlay_on ........ only ticks while the Sider overlay is
+                                         open; the DLL still renders, but goals
+                                         are then detected from the scoreboard
+                                         watcher alone.
+         state_writes_ok=0 ............. state.json cannot be written (folder
+                                         permissions, or the game is on a
+                                         read-only drive).
+         renderer=overlay .............. the DLL was not used; renderer_detail
+                                         says why.
+         last_error=................... the last exception the module caught.
 
-  "WARNING: LuaJIT FFI is off" in sider.log
-    - Add luajit.ext.enabled = 1 to sider.ini (install.bat does this).
+       sider.log lines that start with [NGB] describe the whole environment on
+       the first run: module version, Sider folder, Lua version, LuaJIT, whether
+       ffi/bit exist, whether the memory and match libraries exist, and every
+       ctx.register result.
 
-  Player names show as "PLAYER 11"
-    - Only affects the tier-2 paths. Player.bin had not loaded yet (first
-      seconds after launch) or your build keeps it elsewhere - see debug_log.
+    3. Is the data arriving?
+       <Sider>\content\ngb-presentation\state.json - check "match.live",
+       "match.home.score", "event" and "diag".
 
-  Overlay invisible while the game runs
-    - Use borderless / windowed.
-    - The game window must be the foreground window; the overlay re-attaches
-      within a second. Press F12, then run ngb-overlay\Start_NGB_Overlay.bat.
+         no state.json ................. the module is not writing. See 2.
+         "live": false during a match .. the scoreboard is not being read. Check
+                                         status.data.scoreboard (want "sider")
+                                         and that match-stats.enabled = 1 is in
+                                         sider.ini.
+         "event": null during a goal ... no goal was detected. Check
+                                         status.data.scorer_hook.
+         player numbers all "UNAVAILABLE"  the memory backend is off. Look for
+                                         "MEMORY" in the F7 strip (Sider overlay):
+                                           dll .................. normal
+                                           none ................. no DLL, so no
+                                                                   safe reader
+                                           SIDER RAW ............ you set
+                                                                   allow_unsafe_memory_reads
+                                                                   = 1; the game
+                                                                   can crash
 
-  Keys 7 / 8 / 9 do nothing
-    - Open the Sider overlay first (hotkeys_overlay_only = 1 is the default), or
-      set hotkeys_overlay_only = 0.
+    4. Numbers look wrong
+       diag.stats_coherent / status.data.stats_coherent is false when the player
+       numbers disagree with the scoreboard - that is the guard against
+       "0 shots, 2 goals". The card then shows PLAYER DATA UNAVAILABLE instead of
+       the numbers, and sider.log holds the reason, e.g.
+           stats coherence -> false  (player 3/7: 0 shots but 2 goals)
 
-  Keys 7 / 8 / 9 also trigger game tactics
-    - That is the game reading the same keys. Keep hotkeys_overlay_only = 1, or
-      change hotkey_* in the .ini to keys you do not use.
+  The C# fallback (renderer = overlay) has its own files:
+  <Sider>\ngb-overlay\NGB_Overlay.log and overlay_alive.txt.
 
-  The overlay build fails with error CS.... (compiler messages in the window)
-    - The build is plain C# for .NET Framework 4.x and compiles with no
-      downloads. If you see errors, copy the text of the window and send it on;
-      meanwhile ngb-overlay\NGB_Overlay.exe from an earlier build still starts.
-    - "csc.exe not found" means .NET Framework 4.x is missing: install
-      .NET Framework 4.8 from Windows Update and run Start_NGB_Overlay.bat.
+  Nothing shows when the game is NOT focused
+    That is the case this version was rebuilt for. If it still happens:
+      - check ngb-dll.log for "hooks installed" (if the hook is not in, the
+        fallback window was used, and the fallback only draws on a window it can
+        identify);
+      - press F8 while the game is unfocused. The self-test card is drawn from
+        the same Present call as everything else, so if F8 works the renderer is
+        fine and the cards are simply not being fed data (step 3).
 
+  Cards flicker or vanish during alt-tab / resolution changes
+    That is a ResizeBuffers cycle. The renderer releases its size-dependent
+    objects before the buffers change and rebuilds on the next frame; a one
+    frame gap is expected, a permanent blank is not - report it with the log.
+
+  The game crashes on start
+    Remove ngb-render\NGB_Render.dll and start again. If the game is fine
+    without it, send me ngb-dll.log (it is written before anything is hooked).
+    Nothing else in the mod can crash the game: the Lua module runs inside
+    Sider's pcall.
 
 --------------------------------------------------------------------------------
  9. FILES INSTALLED
@@ -344,10 +411,14 @@ and nothing is filled with zeros to look complete.
 
   <Sider>\modules\NGB_Presentation.lua          the module
   <Sider>\modules\NGB_Presentation.ini          its settings
-  <Sider>\ngb-overlay\                          overlay source + build scripts
-  <Sider>\ngb-overlay\NGB_Overlay.exe           compiled on your PC
-  <Sider>\content\ngb-presentation\state.json   runtime state (created at play)
-  sider.ini                                     two added lines (+ .ngb.bak)
+  <Sider>\ngb-render\NGB_Render.dll             the renderer (prebuilt, x64)
+  <Sider>\ngb-overlay\                          optional C# fallback
+  <Sider>\content\ngb-presentation\state.json   runtime state (rewritten 10x/s)
+  <Sider>\content\ngb-presentation\heartbeat.txt  module alive, 1/s
+  <Sider>\content\ngb-presentation\render.txt     renderer alive, 1/s
+  <Sider>\content\ngb-presentation\ngb-dll.log    renderer log
+  <Sider>\content\ngb-presentation\calibration.txt  only after calibration
+  sider.ini                                     three added lines (+ .ngb.bak)
 
 
 --------------------------------------------------------------------------------
@@ -366,6 +437,39 @@ and nothing is filled with zeros to look complete.
 --------------------------------------------------------------------------------
 11. CHANGES
 --------------------------------------------------------------------------------
+
+  2.0.1  Memory reads go through the DLL. Sider's memory library reads an
+         address by dereferencing it, so a single stale pointer could end the
+         game; ReadProcessMemory cannot. Without the DLL, live player numbers
+         are switched off instead of guessed.
+  2.0.0  The renderer moved inside the game.
+         - New: ngb-render\NGB_Render.dll hooks IDXGISwapChain::Present and
+           draws the cards on the game's own back buffer. Windowed, borderless
+           and exclusive fullscreen; focused or not. No second window, no
+           loader to compile - the module loads the DLL into the game.
+         - Safety: hardware SEH around the hook; on any fault it logs the
+           exception, disables itself and lets the game run. F12 kill switch,
+           dll_enabled = 0 installs no hooks at all. The DLL writes only its own
+           log and render.txt.
+         - Fixed: the overlay no longer requires the game to be the foreground
+           window (this was the reason nothing showed in windowed+unfocused
+           play).
+         - Fixed: the window is found from the PID/exe the game itself writes
+           into state.json (or from the process holding sider.dll), never from
+           "whatever has focus", and never from a list of guessed names.
+         - Fixed: per-player stats can no longer print "0 shots, 2 goals" - a
+           coherence check compares them with the scoreboard every two seconds
+           and the card says PLAYER DATA UNAVAILABLE instead. The feature is
+           still off by default until your build's table is calibrated.
+         - Fixed: uninstall.bat now edits sider.ini correctly (the PowerShell
+           else that made it fail is gone; tools\test_ini.bat proves it).
+         - New: heartbeat.txt, render.txt, a diag/game block in state.json,
+           F7 diagnostics and F8 self-test. Never a silent failure.
+         - New: verify_mod.py rebuilds the DLL and runs host tests for the JSON
+           reader (against a real state.json) and the card layout (six
+           resolutions). The offline suite is no longer circular.
+         - Removed: WinExec/Auto-launch of a companion process, ReadProcessMemory,
+           VirtualQuery, VirtualProtect, __asm__ FFI aliases, GetTickCount64.
 
   1.3.1  The overlay actually compiles again.
          - 1.1.0 - 1.3.0 put [STAThread] on the version constant instead of on

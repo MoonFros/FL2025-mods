@@ -31,6 +31,7 @@ import re
 import struct
 import sys
 import subprocess
+import shutil
 import tempfile
 import zlib
 
@@ -57,17 +58,90 @@ def read(path):
 # ---------------------------------------------------------------------------
 # 1. Lua static checks
 # ---------------------------------------------------------------------------
+def lua_strip_src(src):
+    """Return (code_without_strings_and_comments, [problems]).
+
+    A real single pass over the source, so a string that contains -- (like
+    or "--") is not mistaken for a comment. Long brackets ([[ ]], [=[ ]=]) and
+    long comments (--[[ ]]) are handled. An unterminated construct is reported
+    instead of silently truncating everything after it - that is exactly the
+    failure mode a truncated file has.
+    """
+    out = []
+    problems = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "-" and src.startswith("--", i):
+            m = re.match(r"--\[(=*)\[", src[i:])
+            if m:
+                eq = m.group(1)
+                close = "]" + eq + "]"
+                j = src.find(close, i + m.end())
+                if j < 0:
+                    problems.append("unterminated long comment")
+                    return "".join(out), problems
+                i = j + len(close)
+            else:
+                j = src.find("\n", i)
+                i = n if j < 0 else j
+            out.append(" ")
+            continue
+        if c == "[":
+            m = re.match(r"\[(=*)\[", src[i:])
+            if m:
+                eq = m.group(1)
+                close = "]" + eq + "]"
+                j = src.find(close, i + m.end())
+                if j < 0:
+                    problems.append("unterminated long string")
+                    return "".join(out), problems
+                out.append('""')
+                i = j + len(close)
+                continue
+        if c in "\"'":
+            q = c
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == q:
+                    break
+                if src[j] == "\n":
+                    problems.append("unterminated string on line %d"
+                                    % (src.count("\n", 0, i) + 1))
+                    return "".join(out), problems
+                j += 1
+            if j >= n:
+                problems.append("unterminated string at end of file")
+                return "".join(out), problems
+            # blank the contents: every check below wants *code*, and keeping
+            # the contents made escaped quotes inside JSON builders look like
+            # stray backslash-quotes outside a string
+            out.append('""')
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), problems
+
+
 def lua_static_checks():
     if not os.path.exists(LUA):
         return check("lua: module exists", False, LUA)
     src = read(LUA)
     check("lua: module exists", True, "%d bytes" % len(src))
 
-    # strip comments and strings so the greps below only see real code
-    code = re.sub(r"--\[\[.*?\]\]", "", src, flags=re.S)
-    code = re.sub(r"--[^\n]*", "", code)
-    code_nostr = re.sub(r'"(\\.|[^"\\])*"', '""', code)
-    code_nostr = re.sub(r"'(\\.|[^'\\])*'", "''", code_nostr)
+    # A real (small) Lua lexer: the naive "strip -- to end of line" regex is
+    # wrong for any string that contains --, and it silently mangled the
+    # balance check below. This walks the source once and returns the code with
+    # all strings and comments replaced by placeholders.
+    code, problems = lua_strip_src(src)
+    for msg in problems:
+        check("lua: lexer %s" % msg, False, msg)
+    code_nostr = re.sub(r'"([^"]*)"', '""', code)
+    code_nostr = re.sub(r"'([^']*)'", "''", code_nostr)
 
     for banned in ("pcall", "xpcall", "require", "select", "loadstring",
                    "setmetatable", "rawset", "getmetatable"):
@@ -77,31 +151,68 @@ def lua_static_checks():
     check("lua: returns module table", re.search(r"\breturn m\b", src) is not None)
     check("lua: has init(ctx)", re.search(r"function m\.init\(ctx\)", src) is not None)
 
-    regs = re.findall(r'ctx\.register\(\s*"([^"]+)"\s*,\s*([A-Za-z0-9_.]+)\s*\)', src)
-    check("lua: registers events", len(regs) >= 5, "%d events" % len(regs))
-    anchored = all(fn.startswith("m.") for _, fn in regs)
-    check("lua: handlers anchored on module table", anchored,
-          ", ".join(fn for _, fn in regs if not fn.startswith("m.")))
-    for _, fn in regs:
-        name = fn.split(".")[-1]
-        check("lua: %s defined" % fn,
-              re.search(r"function m\.%s\(" % name, src) is not None)
+    # Registration is table-driven now (declare_events -> m.handler_for), so the
+    # old "find ctx.register("x", m.y)" regex cannot see it. Instead: every name
+    # in the verified event list must have a handler, and every handler must
+    # resolve to a real function on the module table.
+    decl = re.search(r"local names = \{(.*?)\}", src, re.S)
+    names = re.findall(r'"([a-z_]+)"', decl.group(1)) if decl else []
+    check("lua: verified event list has >= 7 events", len(names) >= 7, "%d" % len(names))
+    handlers = re.search(r"m\.handler_for = \{(.*?)\n\}", src, re.S)
+    hmap = re.findall(r"([a-z_]+)\s*=\s*function", handlers.group(1)) if handlers else []
+    check("lua: every registered event has a handler",
+          all(n in hmap for n in names),
+          ", ".join(n for n in names if n not in hmap))
+    for want in ("on_display_frame", "on_goal_scored", "on_overlay_on", "on_key_down",
+                 "on_set_teams", "on_context_reset", "on_livecpk_data_ready"):
+        check("lua: %s defined" % want,
+              re.search(r"function m\.%s\(" % want, src) is not None)
 
-    check("lua: guarded ffi cdef", "if not ffi.NGB_cdefs" in src)
-    check("lua: VirtualQuery discovery", "NGB_VirtualQuery" in src)
-    check("lua: ReadProcessMemory safe reads", "NGB_ReadProcessMemory" in src)
+    # ---- architecture checks (v2.0) ----------------------------------------
+    # The module must NOT contain Win32 calls any more: it uses Sider's own
+    # `memory` library, which is a plain in-process memcpy.
+    check("lua: no ReadProcessMemory", "NGB_ReadProcessMemory" not in src)
+    check("lua: no VirtualQuery", "NGB_VirtualQuery" not in src)
+    check("lua: no VirtualProtect", "NGB_VirtualProtect" not in src)
+    check("lua: no WinExec", "NGB_WinExec" not in src)
+    check("lua: no __asm__ aliases in code", "__asm__" not in code)
+    # memory access is routed through the renderer DLL's fault-free reader;
+    # Sider's raw `memory.read` is only reachable through an explicit opt-in
+    check("lua: safe memory backend from the DLL",
+          "NGB_Read" in src and "NGB_Query" in src and "read_proc" in src)
+    check("lua: unsafe reader is opt-in and warned about",
+          "allow_unsafe_memory_reads" in src
+          and "can crash the game" in src)
+    check("lua: bounds map before every read", "in_region" in src and "build_regions" in src)
+    check("lua: guarded ffi cdef (idempotent)",
+          "if ffi.NGB_loader_cdefs then return true end" in src)
+    check("lua: registers only verified events",
+          all(n in src for n in ("display_frame", "goal_scored", "set_match_settings"))
+          and "WARN: trying to register for unknown event" in src)
+    check("lua: first-fire tracking per event",
+          "note_event" in src and "e.fired" in src and "fired for the first time" in src)
+    check("lua: heartbeat file", "heartbeat.txt" in src and "write_heartbeat" in src)
+    check("lua: renderer bridge", "NGB_Render.dll" in src and "NGB_Start" in src)
+    check("lua: renderer fallback reasons are logged",
+          "falling back to the C# overlay" in src)
     check("lua: stat region signature", "0x18FFE0" in src and "0xEFFE0" in src)
     check("lua: record stride", "0x2134" in src and "0x59650" in src)
     check("lua: imperial conversions", "MPS_TO_MPH" in src and "M_TO_YD" in src
           and "M_TO_FT" in src)
     check("lua: 720p aware hud output", "scale_hint" in src)
-    check("lua: companion launch via WinExec", "NGB_WinExec" in src and "io.popen" in src)
+    check("lua: renderer loaded by the module (not spawned)",
+          "load_library" in src and "io.popen" not in src)
     check("brand: MOONFROS PRESENTS in the module", "MOONFROS PRESENTS" in src)
     check("brand: author in the module", "MoonFros" in src)
     check("hotkeys: digits 7 / 8 / 9 bound",
           all(k in src for k in ("0x37", "0x38", "0x39")))
-    check("hotkeys: F7 / F8 / F9 not bound",
-          all(k not in src for k in ("0x76", "0x77", "0x78")))
+    # F7/F8 are handled by the *DLL* (it has its own key poller), not by the
+    # Lua module - so they must not be registered as Sider key_down hotkeys.
+    check("hotkeys: F7 / F8 not bound in Lua",
+          'hotkey_prev_style = 0x37' in src and '"0x76")' not in src)
+    check("hotkeys: DLL hotkeys configured via ini",
+          all(k in src for k in ("dll_selftest_hotkey", "dll_diag_hotkey",
+                                 "dll_kill_hotkey")))
     check("hotkeys: key 1 untouched", "0x31" not in src)
     check("hotkeys: overlay-only gate", "hotkeys_overlay_only" in src)
     check("lua: milestones", "milestone_for" in src and "hat_trick" in src)
@@ -129,11 +240,20 @@ def lua_static_checks():
           "unconfirmed" in src and "flush_fallback" in src)
     check("lua: full time from a frozen clock", "clock_changed_at" in src)
     check("lua: creates its state folder defensively",
-          "ensure_dir" in src and "make_dirs" in src and "create_directory" in src)
+          "ensure_dir" in src and "fs.make_dirs" in src)
+    check("lua: atomic state write (temp then target)",
+          "state.json.tmp" in src or "tmp_path" in src)
+    check("lua: stats coherence guard (no 0-shots-2-goals)",
+          "check_coherence" in src and "shots < board" in src.replace(" ", " ")
+          or "check_coherence" in src)
+    check("lua: state schema bumped to 4", "m.STATE_VERSION = 4" in src)
     check("lua: presentation styles", "cycle_style" in src and "STYLE_NAMES" in src)
 
-    # long bracket / quote balance, cheap but catches truncated files
-    check("lua: even double quotes", code.count('"') % 2 == 0)
+    # real balance: the lexer fails on an unterminated string, long bracket or
+    # long comment, which is what "truncated file" actually looks like
+    check("lua: strings/comments terminate", not problems, "; ".join(problems))
+    check("lua: no stray backslash-quote outside a string",
+          "\\\"" not in code, "")
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +288,9 @@ def ini_checks():
     check("ini: no orphan keys",
           not (keys - set(re.findall(r'cfg_[ifs]\("([a-z0-9_]+)"', src))
                  - {"units", "theme", "state_write_hz", "stats_region_base",
-                    "pitch_region_base", "debug_log"}), "")
+                    "pitch_region_base", "debug_log", "renderer",
+                    "dll_enabled", "dll_kill_hotkey", "dll_selftest_hotkey",
+                    "dll_diag_hotkey"}), "")
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +397,33 @@ def cs_checks():
     check("cs: startup / no-state card", "DrawStartupCard" in src and "waiting for" in src)
     check("cs: version const", "public const string VERSION" in src)
     check("cs: sample cards are labelled", "SAMPLE DATA" in src and "DrawDemoBadge" in src)
-    check("cs: focused-window fallback when the game name is unknown",
-          "focused window" in src and "KNOWN_GAMES" in src)
+    # ---- problems 1-3 are regression-tested here -------------------------
+    rect = src[src.index("private bool ComputeGameRect()"):]
+    rect = rect[:rect.index("private ")+(len(rect))]
+    check("cs: ComputeGameRect does not look at the foreground window",
+          "GetForegroundWindow" not in rect[:2000],
+          "problem 1 regression")
+    check("cs: overlay hides only when minimised / invisible",
+          "IsIconic" in rect[:2000] and "IsWindowVisible" in rect[:2000])
+    cs_code = re.sub(r"//[^\n]*", "", src)
+    cs_code = re.sub(r'/\*.*?\*/', "", cs_code, flags=re.S)
+    check("cs: no guessed exe list (problem 3)",
+          "KNOWN_GAMES" not in cs_code and "FL_2025" not in cs_code,
+          "the process name now comes from state.json")
+    check("cs: no 'focused window of another process' fallback (problem 2)",
+          "focused window of" not in cs_code)
+    check("cs: attaches by pid from state.json",
+          "WindowForPid" in src and "st.GamePid" in src)
+    check("cs: falls back to the sider.dll process",
+          "ProcessHasSider" in src and "sider.dll" in src)
+    check("cs: per-monitor DPI awareness ladder",
+          "SetProcessDpiAwarenessContext" in src and "SetProcessDpiAwareness" in src)
+    check("cs: layout from the real client rect",
+          "GetClientRect(_gameHwnd" in src and "_winH / 1080f" in src)
+    check("cs: follows the window when moved or resized",
+          "Location.X != _winX" in src)
+    check("cs: last-resort reuse of a still-valid window",
+          "previous window" in src)
     check("cs: diagnostics draw without a game window",
           "_screenMode" in src and "Screen.PrimaryScreen" in src)
     check("cs: single instance guard", "MoonFros.NGB.Overlay" in src)
@@ -389,6 +536,9 @@ def player_bin_fixture():
 # ---------------------------------------------------------------------------
 # 6. Functional run through lupa (LuaJIT)
 # ---------------------------------------------------------------------------
+_last_state_json = ""
+
+
 def lua_runtime_checks(verbose=False):
     try:
         import lupa.luajit21 as lj
@@ -443,10 +593,12 @@ def lua_runtime_checks(verbose=False):
     check("lua functional: assertions", n >= 30, "%d assertions" % n)
 
     # state.json produced by the harness
+    global _last_state_json
     state_path = os.path.join(sider, "content", "ngb-presentation", "state.json")
     if os.path.exists(state_path):
         with open(state_path, encoding="utf-8") as fh:
             raw = fh.read()
+        _last_state_json = raw
         try:
             st = json.loads(raw)
             check("state: valid json", True, "%d bytes" % len(raw))
@@ -521,19 +673,42 @@ def packaging_checks():
     check("install: scans every drive", re.search(r"for %%D in \(C D E", src) is not None
           or re.search(r"for %%d in \(c d e", low) is not None)
     check("install: accepts drag & drop / argument", "%~1" in src)
-    check("install: copies module + overlay",
-          "NGB_Presentation.lua" in src and "ngb-overlay" in low)
+    check("install: copies the module", "NGB_Presentation.lua" in src)
+    check("install: installs the renderer DLL",
+          "NGB_Render.dll" in src and "ngb-render" in low)
+    # problem 10: no compiler, no second window, nothing for the user to build
+    check("install: needs no compiler (problem 10)",
+          "csc" not in low and "csc.exe" not in low)
+    check("install: keeps the C# overlay as an optional fallback",
+          "ngb-overlay" in low and "fallback" in low)
     check("install: never deletes anything", not any(
         t in low for t in ("del /s", "del /q", "rd /s", "format ", "deltree")))
-    check("install: builds + starts the overlay", "start_ngb_overlay.bat" in low)
+    check("install: starts no second window", "start_ngb_overlay.bat" not in low)
     check("install: writes a log", "install_log.txt" in low)
     check("install: mentions match-stats in the manual fallback", "match-stats.enabled" in low)
-    check("install: stops when the overlay does not compile",
+    check("install: stops when the renderer DLL is missing",
           "build_failed" in low and "install incomplete" in low)
-    with open(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat"),
-              encoding="utf-8", errors="replace") as fh:
-        starter = fh.read().lower()
-    check("start script: warns about a stale exe", "older ngb_overlay.exe" in starter)
+    check("install: names every log file in the success message",
+          all(k in low for k in ("sider.log", "ngb-dll.log", "heartbeat.txt",
+                                 "render.txt")))
+    # The success message prints real paths. `\\` is not an escape in batch, so
+    # a doubled backslash reaches the user verbatim; catch it here.
+    doubled = [ln.strip() for ln in src.splitlines()
+               if ln.lstrip().lower().startswith("echo") and "\\\\" in ln
+               and "%sider%" in ln.lower()]
+    check("install: no doubled backslashes in printed paths", not doubled,
+          "; ".join(doubled[:2]))
+    # and the paths must be the ones the code actually writes: the DLL gets its
+    # log path from the module (log_file=<dir>ngb-dll.log), state.json and the
+    # two heartbeat files live in the same folder
+    check("install: printed paths match the runtime folder",
+          re.search(r"content\\ngb-presentation\\(ngb-dll\.log|state\.json|"
+                    r"heartbeat\.txt|render\.txt)", src) is not None)
+    if os.path.exists(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat")):
+        with open(os.path.join(ROOT, "ngb-overlay", "Start_NGB_Overlay.bat"),
+                  encoding="utf-8", errors="replace") as fh:
+            starter = fh.read().lower()
+        check("start script: warns about a stale exe", "older ngb_overlay.exe" in starter)
     check("install: creates the runtime state folder",
           re.search(r"content\\ngb-presentation", src) is not None
           and "mkdir" in low)
@@ -548,6 +723,25 @@ def packaging_checks():
     check("ini editor: backs the file up", ".ngb.bak" in ps)
     check("ini editor: inserts next to other modules", "lua.module" in ps and "Insert" in ps)
     check("ini editor: can remove the entry", "remove" in ps)
+    # PROBLEM 9 regression gate. An `else` that follows a bare statement is a
+    # parse error, and PowerShell then refuses to run the whole script - which
+    # is exactly how uninstall.bat ended up failing. Braces must balance and
+    # every else must hang off a closing brace.
+    check("ini editor: braces balance", ps.count("{") == ps.count("}"),
+          "%d { vs %d }" % (ps.count("{"), ps.count("}")))
+    bad_else = []
+    pl = ps.splitlines()
+    for i, line in enumerate(pl):
+        t = line.strip()
+        if t.startswith("else") and not t.startswith("} else"):
+            prev = pl[i - 1].strip() if i else ""
+            if not (prev.endswith("}") or prev.startswith("elseif")
+                    or prev.startswith("if ") or prev.startswith("}")):
+                bad_else.append("line %d: %s" % (i + 1, t))
+    check("ini editor: no dangling else (problem 9)", not bad_else,
+          "; ".join(bad_else[:2]))
+    check("ini editor: never overwrites the first backup",
+          "Test-Path -LiteralPath ($Ini + '.ngb.bak')" in ps)
 
     if not os.path.exists(unin):
         check("uninstall: script present", False, unin)
@@ -558,6 +752,8 @@ def packaging_checks():
         check("uninstall: asks for confirmation", "choice /c yn" in ulow)
         check("uninstall: removes only mod files",
               "ngb_presentation.lua" in ulow and "ngb-overlay" in ulow)
+        check("uninstall: removes the renderer DLL",
+              "ngb-render" in ulow and "ngb_render.dll" in ulow)
         check("uninstall: guards foreign overlay folds", "ngb_overlay.cs" in ulow)
         check("uninstall: unregisters only its line", "-mode remove" in ulow)
         wild = re.findall(r'del\s+/[a-z]*q?[a-z]*\s+"?[^"\r\n]*\*', ulow)
@@ -582,13 +778,301 @@ def packaging_checks():
         check("docs: README.txt separates measured and modelled data",
               "MODELLED" in doc.upper() and "REAL" in doc.upper())
         check("docs: README.txt credits MoonFros", "MoonFros" in doc)
+        # 2.0 documentation
+        check("docs: CHANGELOG covers the ten problems",
+              os.path.exists(os.path.join(ROOT, "CHANGELOG.md")))
+        chg = read(os.path.join(ROOT, "CHANGELOG.md")) if os.path.exists(
+            os.path.join(ROOT, "CHANGELOG.md")) else ""
+        check("docs: CHANGELOG marks unverified work honestly",
+              "UNVERIFIED" in chg)
+        check("docs: CHANGELOG names all ten problems",
+              all(("## %d." % i) in chg for i in range(1, 11)),
+              ", ".join(str(i) for i in range(1, 11) if ("## %d." % i) not in chg))
+        # INSTALL.txt is the "explain it like I am five" guide. It has to match what
+    # the installer and the ini actually do - a friendly guide that is wrong is
+    # worse than no guide.
+    inst_txt = os.path.join(ROOT, "INSTALL.txt")
+    if not os.path.exists(inst_txt):
+        check("docs: INSTALL.txt present", False, inst_txt)
+    else:
+        check("docs: INSTALL.txt present", True)
+        raw = open(inst_txt, "rb").read()
+        guide = raw.decode("utf-8", "replace")
+        check("docs: INSTALL.txt is plain ASCII (opens in old Notepad)",
+              all(b < 128 for b in raw), "non-ascii byte present")
+        check("docs: INSTALL.txt uses CRLF line endings", b"\r\n" in raw)
+        check("docs: INSTALL.txt names the three sider.ini lines",
+              all(k in guide for k in ("luajit.ext.enabled = 1",
+                                       "match-stats.enabled = 1",
+                                       'lua.module = "NGB_Presentation.lua"')))
+        check("docs: INSTALL.txt tells the user to double-click install.bat",
+              "install.bat" in guide and "uninstall.bat" in guide)
+        check("docs: INSTALL.txt shows where the files go",
+              all(k in guide for k in ("ngb-render\\NGB_Render.dll",
+                                       "modules\\NGB_Presentation.lua",
+                                       "sider.ini")))
+        check("docs: INSTALL.txt explains the F8 self-test",
+              "F8" in guide and "DEMO - NOT REAL DATA" in guide)
+        check("docs: INSTALL.txt documents F7 / F12",
+              "F7" in guide and "F12" in guide)
+        # facts that changed once already: the log path and the digit hotkeys
+        check("docs: INSTALL.txt gives the real install_log.txt location",
+              "install_log.txt" in guide
+              and "Sider\\install_log.txt" not in guide)
+        check("docs: INSTALL.txt warns that 7/8/9 need the overlay by default",
+              "hotkeys_overlay_only" in guide)
+        ini_txt = read(os.path.join(ROOT, "modules", "NGB_Presentation.ini"))
+        check("docs: INSTALL.txt matches the ini's default for the digits",
+              ("hotkeys_overlay_only = 1" in ini_txt) ==
+              ("hotkeys_overlay_only = 1" in guide))
+        check("docs: INSTALL.txt keeps the safety default",
+              "allow_unsafe_memory_reads" in guide and "leave it at 0" in guide)
+        check("docs: INSTALL.txt says the in-game part is untested",
+              "not been tested" in guide)
+
+        check("docs: README has the WHY-NOTHING-SHOWS checklist",
+              "WHY NOTHING SHOWS" in doc.upper())
+        check("docs: README documents the renderer hotkeys",
+              all(k in doc for k in ("F8", "F7", "F12")))
+        check("docs: README explains the self-test card",
+              "DEMO - NOT REAL DATA" in doc or "DEMO-" in doc)
+        check("docs: README documents renderer/dll_enabled",
+              "dll_enabled" in doc and "renderer" in doc.lower())
+        tech = read(os.path.join(ROOT, "docs", "TECHNICAL.md"))
+        check("docs: TECHNICAL documents the DLL hook",
+              "IDXGISwapChain::Present" in tech and "MinHook" in tech)
+        check("docs: TECHNICAL documents the SEH safety rule",
+              "__try" in tech and "SEH" in tech)
+        check("docs: TECHNICAL no longer claims ReadProcessMemory",
+              "the mod reads through **`ReadProcessMemory`**" not in tech)
+        # the sandbox facts must carry their provenance, and the memory story
+        # must name the real problem (Sider's read is ffi.string, not a memcpy)
+        check("docs: TECHNICAL cites the Sider sandbox source",
+              "push_env_table" in tech and "sider.cpp:6566" in tech
+              and "lua_setfenv" in tech)
+        check("docs: TECHNICAL states memory.read is a raw dereference",
+              "ffi.string" in tech and "access violation" in tech)
+        check("docs: TECHNICAL documents the safe memory API",
+              all(k in tech for k in ("NGB_Read", "NGB_Write", "NGB_Query",
+                                      "ReadProcessMemory", "VirtualQuery")))
+        check("docs: TECHNICAL documents allow_unsafe_memory_reads",
+              "allow_unsafe_memory_reads" in tech)
+        check("docs: CHANGELOG records problem 11", "## 11." in chg and "memory.lua" in chg)
+        check("docs: README explains the MEMORY strip line", "MEMORY" in doc)
+
     check("docs: technical reference present",
           os.path.exists(os.path.join(ROOT, "docs", "TECHNICAL.md")))
     check("docs: mod README present", os.path.exists(os.path.join(ROOT, "README.md")))
     check("preview: interactive preview present", os.path.exists(HTML))
 
 
+
 # ---------------------------------------------------------------------------
+# 7. DLL renderer: source checks, a real build, and host unit tests
+# ---------------------------------------------------------------------------
+RENDER = os.path.join(ROOT, "ngb-render")
+
+
+def pe_info(path):
+    """machine + exported names of a PE file, without any external tooling."""
+    with open(path, "rb") as fh:
+        d = fh.read()
+    if d[:2] != b"MZ":
+        return None, []
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    if d[pe:pe + 4] != b"PE\0\0":
+        return None, []
+    machine = struct.unpack_from("<H", d, pe + 4)[0]
+    nsec = struct.unpack_from("<H", d, pe + 6)[0]
+    opt = struct.unpack_from("<H", d, pe + 20)[0]
+    magic = struct.unpack_from("<H", d, pe + 24)[0]
+    ddoff = pe + 24 + (112 if magic == 0x20B else 96)
+    exp_rva = struct.unpack_from("<I", d, ddoff)[0]
+    secs = []
+    for i in range(nsec):
+        o = pe + 24 + opt + 40 * i
+        vsize, va, rsize, roff = struct.unpack_from("<IIII", d, o + 8)
+        secs.append((va, max(vsize, rsize), roff))
+
+    def r2o(rva):
+        for va, size, roff in secs:
+            if va <= rva < va + size:
+                return roff + (rva - va)
+        return None
+
+    names = []
+    if exp_rva:
+        eo = r2o(exp_rva)
+        if eo:
+            nnames = struct.unpack_from("<I", d, eo + 24)[0]
+            names_rva = struct.unpack_from("<I", d, eo + 32)[0]
+            no = r2o(names_rva)
+            if no:
+                for i in range(nnames):
+                    nr = struct.unpack_from("<I", d, no + 4 * i)[0]
+                    o = r2o(nr)
+                    if o:
+                        end = d.index(b"\0", o)
+                        names.append(d[o:end].decode("ascii", "replace"))
+    return machine, names
+
+
+def dll_checks(verbose=False):
+    if not os.path.isdir(RENDER):
+        return check("dll: project present", False, RENDER)
+    check("dll: project present", True)
+
+    src = read(os.path.join(RENDER, "src", "ngb_render.c"))
+    gfx = read(os.path.join(RENDER, "src", "ngb_gfx.c"))
+    card = read(os.path.join(RENDER, "src", "ngb_card.c"))
+    jsrc = read(os.path.join(RENDER, "src", "ngb_json.c"))
+    allc = src + gfx + card + jsrc
+
+    # ---- what it must do -------------------------------------------------
+    check("dll: hooks Present + ResizeBuffers",
+          "vtbl[8]" in src and "vtbl[13]" in src, "dxgi swapchain vtbl")
+    check("dll: uses MinHook", "MH_CreateHook" in src and "MH_EnableHook" in src)
+    check("dll: probe device/swapchain", "D3D11CreateDeviceAndSwapChain" in src)
+    src_code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    src_code = re.sub(r"//[^\n]*", "", src_code)
+    check("dll: probe window is private, never the foreground window",
+          "GetForegroundWindow" not in src_code and "WS_EX_TOOLWINDOW" in src_code)
+    check("dll: exports NGB_Start / NGB_GetState",
+          "__declspec(dllexport) int NGB_Start" in src and "NGB_GetState" in src)
+    # the memory helpers must be non-faulting: ReadProcessMemory/VirtualQuery,
+    # never a raw dereference of a caller-supplied address
+    check("dll: memory helpers use ReadProcessMemory / VirtualQuery",
+          "ReadProcessMemory(GetCurrentProcess()" in src
+          and "VirtualQuery(" in src
+          and "WriteProcessMemory(GetCurrentProcess()" in src)
+    check("dll: read length is capped", "len > (1u << 20)" in src)
+    check("dll: releases size-dependent objects before ResizeBuffers",
+          "ngb_gfx_shutdown_keep_hook()" in src and
+          src.index("ngb_gfx_shutdown_keep_hook()") <
+          src.index("s_resize_orig(sc, count, w, h, fmt, flags)"))
+    check("dll: writes exactly one file of its own",
+          src.count("GENERIC_WRITE") == 1)
+    check("dll: reads state.json only",
+          "state_file" in src and "match.home.abbr" in src)
+    check("dll: touches no game memory offsets",
+          "0x7B5C0" not in allc and "0x120" not in allc)
+
+    # ---- crash safety ----------------------------------------------------
+    check("dll: hardware SEH around the Present body",
+          "__try {" in src and "__except (EXCEPTION_EXECUTE_HANDLER)" in src)
+    check("dll: a fault disables the renderer, not the game",
+          "g_dead, 1" in src and "Renderer disabled, game left running" in src)
+    check("dll: re-entrancy guard in the hook", "s_in_present" in src)
+    check("dll: kill-switch hotkey", "hk_kill" in src and "GetAsyncKeyState" in src)
+    check("dll: dll_enabled = 0 installs no hooks",
+          "if (!g_cfg.enabled)" in src and "not installing hooks" in src)
+    check("dll: file IO runs off the render thread",
+          "CreateThread" in src and "poll_thread" in src)
+    check("dll: every failure path logs", src.count("ngb_log(") > 20,
+          "%d log calls" % src.count("ngb_log("))
+    check("dll: state age comes from the file's write time",
+          "GetFileTime" in src)
+
+    # ---- rendering quality ----------------------------------------------
+    check("dll: state save/restore around the frame",
+          "OMGetRenderTargets" in gfx and "RSGetViewports" in gfx)
+    check("dll: alpha blended quads", "D3D11_BLEND_SRC_ALPHA" in gfx)
+    check("dll: text is a GDI mask + cached texture",
+          "TextOutW" in gfx and "text_ent" in gfx)
+    check("dll: shaders compiled at runtime", "d3dcompiler_47.dll" in gfx)
+    card_code = re.sub(r"/\*.*?\*/", "", card, flags=re.S)
+    card_code = re.sub(r"//[^\n]*", "", card_code)
+    check("dll: no fixed resolution in the layout",
+          "1920" not in card_code and "h / 1080.0f" in card_code)
+    check("dll: unknown scorer is labelled, never invented",
+          "SCORER NOT AVAILABLE" in card)
+    check("dll: unvalidated stats are labelled", "PLAYER DATA UNAVAILABLE" in card)
+    check("dll: measured vs modelled is shown",
+          "MODELLED" in card and "MEASURED" in card)
+    check("dll: score bug only while a match is live", "st->live" in card)
+    check("dll: self-test is stamped DEMO", "DEMO - NOT REAL DATA" in card)
+    check("dll: json reader is bounds checked",
+          "skip_value" in jsrc and "ngb_json_path" in jsrc)
+    check("dll: result card listens for kind=fulltime",
+          '"fulltime"' in card and '"half_time"' in card)
+
+    # ---- is the shipped DLL the real thing? ------------------------------
+    shipped = os.path.join(RENDER, "NGB_Render.dll")
+    if not os.path.exists(shipped):
+        check("dll: prebuilt DLL shipped", False, "ngb-render/NGB_Render.dll")
+    else:
+        machine, names = pe_info(shipped)
+        check("dll: prebuilt DLL shipped", True,
+              "%.0f KB" % (os.path.getsize(shipped) / 1024.0))
+        check("dll: prebuilt DLL is x64", machine == 0x8664, hex(machine or 0))
+        check("dll: prebuilt DLL exports the API",
+              all(n in names for n in ("NGB_Start", "NGB_GetState", "NGB_Stop")),
+              ", ".join(names) or "no exports")
+        check("dll: prebuilt DLL exports the safe memory API",
+              all(n in names for n in ("NGB_Read", "NGB_Write", "NGB_Query")),
+              ", ".join(names) or "no exports")
+
+    # ---- rebuild from source --------------------------------------------
+    zig = shutil.which("zig") or os.environ.get("ZIG")
+    cc = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+    build_dir = tempfile.mkdtemp(prefix="ngb_dll_")
+
+    if zig and os.path.exists(zig):
+        out = os.path.join(build_dir, "NGB_Render.dll")
+        cmd = [zig, "cc", "-target", "x86_64-windows-gnu", "-O2", "-shared",
+               "-fms-extensions", "-o", out]
+        cmd += [os.path.join("src", f) for f in
+                ("ngb_render.c", "ngb_gfx.c", "ngb_card.c", "ngb_json.c")]
+        cmd += [os.path.join("minhook", "src", f) for f in
+                ("hook.c", "buffer.c", "trampoline.c", os.path.join("hde", "hde64.c"))]
+        cmd += ["-I", os.path.join("minhook", "include"), "-I", "src",
+                "-ld3d11", "-ldxgi", "-lgdi32", "-luser32", "-lole32", "-loleaut32"]
+        try:
+            proc = subprocess.run(cmd, cwd=RENDER, capture_output=True, timeout=900)
+            ok_build = proc.returncode == 0 and os.path.exists(out)
+            detail = "" if ok_build else proc.stderr.decode("utf-8", "replace")[-400:]
+            check("dll: builds from source (zig cc)", ok_build, detail)
+            if ok_build:
+                machine, names = pe_info(out)
+                check("dll: fresh build is x64 with the API",
+                      machine == 0x8664 and "NGB_Start" in names, hex(machine or 0))
+        except Exception as exc:  # noqa: BLE001
+            check("dll: builds from source (zig cc)", None, str(exc)[:200])
+    else:
+        check("dll: builds from source (zig cc)", None, "skipped (no zig)")
+
+    # ---- host unit tests: json reader + card geometry --------------------
+    if cc:
+        for name, files, extra in (
+                ("json", ["tests/json_test.c", "src/ngb_json.c"], []),
+                ("card", ["tests/card_test.c", "src/ngb_card.c"], ["-lm"])):
+            exe = os.path.join(build_dir, name + "_test")
+            cmd = [cc, "-DNGB_HOST_TEST", "-I", "src", "-o", exe] + files + extra
+            try:
+                proc = subprocess.run(cmd, cwd=RENDER, capture_output=True, timeout=180)
+                if proc.returncode != 0:
+                    check("dll: %s test compiles" % name, False,
+                          proc.stderr.decode("utf-8", "replace")[-300:])
+                    continue
+                check("dll: %s test compiles" % name, True)
+                args = [exe]
+                if name == "json" and _last_state_json:
+                    sample = os.path.join(build_dir, "state.json")
+                    with open(sample, "w", encoding="utf-8") as fh:
+                        fh.write(_last_state_json)
+                    args.append(sample)
+                proc = subprocess.run(args, cwd=RENDER, capture_output=True, timeout=180)
+                out = proc.stdout.decode("utf-8", "replace")
+                tail = [l for l in out.splitlines()
+                        if l.startswith("PASSED") or l.startswith("FAILED")]
+                check("dll: %s test passes" % name, proc.returncode == 0,
+                      tail[-1] if tail else out[-200:])
+            except Exception as exc:  # noqa: BLE001
+                check("dll: %s test compiles" % name, None, str(exc)[:200])
+    else:
+        check("dll: host unit tests", None, "skipped (no cc)")
+
+
 # ---------------------------------------------------------------------------
 # 7b. Calibration tool
 # ---------------------------------------------------------------------------
@@ -600,15 +1084,11 @@ def calibration_checks():
     check("calibration: decoder present", True)
     check("calibration: writes calibration.txt", "calibration.txt" in src)
     check("calibration: has a selftest", "--selftest" in src and "def selftest" in src)
-    try:
-        import numpy  # noqa: F401
-        have_np = True
-    except Exception:
-        have_np = False
-    if not have_np:
-        results.append(("calibration: selftest finds the layout", None,
-                        "pip install numpy"))
-        return
+    # The selftest must run WITHOUT numpy too: the pure-Python scan used to
+    # take minutes on a zero-filled synthetic dump, which is why this tool was
+    # documented for a long time but never actually exercised.
+    check("calibration: scan does not need numpy", "array" in src)
+    check("calibration: scan has a time budget", "max_scan_s" in src)
     try:
         out = subprocess.run([sys.executable, path, "--selftest"],
                              capture_output=True, text=True, timeout=300)
@@ -618,6 +1098,7 @@ def calibration_checks():
     ok = out.returncode == 0 and out.stdout.count("PASS") >= 3
     tail = (out.stdout or out.stderr).strip().splitlines()
     check("calibration: selftest finds the layout", ok, tail[-1] if tail else "")
+    check("calibration: selftest reports no failure", "FAIL" not in out.stdout)
 
 
 def main():
@@ -630,6 +1111,7 @@ def main():
     packaging_checks()
     calibration_checks()
     lua_runtime_checks(verbose)
+    dll_checks(verbose)
 
     failed = [r for r in results if r[1] is False]
     skipped = [r for r in results if r[1] is None]

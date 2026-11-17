@@ -299,6 +299,9 @@ m._test.set_cfg({ stats_poll_ms = "0", position_poll_ms = "0", state_write_hz = 
 -- the scan is only trusted after it passes validation; in the harness the
 -- fixture is already known-good, so mark it validated here
 m.stats_validated = true
+-- the harness supplies a simulated image, not a process: tell the module it has
+-- a working (simulated) backend, exactly as the DLL would in game
+m._test.set_mem(true, "sim")
 
 -- baseline tick (2 frames so the 8 ms gate and the poll gates open)
 for i = 1, 3 do clock_ms = clock_ms + 200; m.tick(clock_ms) end
@@ -398,7 +401,7 @@ check("goal: card appears after the delay",
 -- state.json
 clock_ms = clock_ms + 200; m.tick(clock_ms)
 local state = m._test.state()
-check("state: schema version", state.v == 3, state.v)
+check("state: schema version", state.v == 4, state.v)
 check("state: hud master flag", state.hud.master ~= nil, tostring(state.hud.master))
 check("state: hud style", state.hud.style ~= nil, tostring(state.hud.style))
 check("state: hud analysis flag", state.hud.analysis ~= nil, tostring(state.hud.analysis))
@@ -512,6 +515,10 @@ check("overlay text respects units", string.find(text, "km/h", 1, true) ~= nil
       or string.find(text, "SHOTS", 1, true) ~= nil, "metric default")
 check("overlay text carries the brand", string.find(text, "MOONFROS PRESENTS", 1, true) ~= nil)
 check("overlay text shows the active state", string.find(text, "PRESENTATION", 1, true) ~= nil)
+check("overlay text carries the diagnostics panel",
+      type(text) == "string" and string.find(text, "RENDERER", 1, true) ~= nil
+      and string.find(text, "EVENTS", 1, true) ~= nil
+      and string.find(text, "STATE", 1, true) ~= nil)
 check("overlay text lists the hotkeys", string.find(text, "[7]", 1, true) ~= nil
       and string.find(text, "[8]", 1, true) ~= nil and string.find(text, "[9]", 1, true) ~= nil)
 
@@ -526,7 +533,7 @@ m._test.set_region(0, 0)
 m._test.reset()
 clock_ms = clock_ms + 400; m.tick(clock_ms)
 check("no stats region: tick survives", true)
-check("no stats region: state still valid", m._test.state().v == 3)
+check("no stats region: state still valid", m._test.state().v == 4)
 
 -- context reset clears everything
 m.on_context_reset(CTX)
@@ -640,6 +647,9 @@ m.ev = nil
 m.scorers = {}
 m.tally = {}
 m.stats_validated = true
+-- the harness supplies a simulated image, not a process: tell the module it has
+-- a working (simulated) backend, exactly as the DLL would in game
+m._test.set_mem(true, "sim")
 
 -- ---------------------------------------------------------------------------
 -- 11. Presentation controls (the 7 / 8 / 9 hotkeys)
@@ -798,5 +808,36 @@ check("heartbeat: matching version is reported as running",
       string.find(txt, "OVERLAY   running", 1, true) ~= nil,
       (string.match(txt, "OVERLAY%s+running[^\n]*") or ""))
 if cdir then os.remove(cdir .. "/overlay_alive.txt") end
+
+-- ---------------------------------------------------------------------------
+-- the overlay must name the memory backend: "player numbers are missing" is
+-- the most common report, and the strip has to answer it in one line
+local panel = m.overlay_text()
+check("overlay: names the memory backend",
+      string.find(panel, "MEMORY", 1, true) ~= nil
+      and string.find(panel, "simulated", 1, true) ~= nil,
+      (string.match(panel, "MEMORY[^\n]*") or ""))
+
+-- ---------------------------------------------------------------------------
+-- Memory safety: with no fault-free backend the module must fail closed.
+-- Sider's `memory.read` is a raw ffi.string, so "fail closed" is the only
+-- acceptable behaviour when the DLL is missing.
+-- ---------------------------------------------------------------------------
+local saved_sim = m.sim
+m.sim = nil
+m._test.set_mem(false, "none")
+check("mem: backend reported as none", m._test.mem_backend() == "none",
+      m._test.mem_backend())
+check("mem: load fails closed without a backend", m.load(0x7FF000001000, 4) == false,
+      tostring(m.load(0x7FF000001000, 4)))
+check("mem: read_big fails closed without a backend",
+      m.read_big(0x7FF000001000, 64) == nil,
+      tostring(m.read_big(0x7FF000001000, 64)))
+check("mem: read_u32 fails closed without a backend",
+      m.read_u32(0x7FF000001000) == nil, tostring(m.read_u32(0x7FF000001000)))
+m.sim = saved_sim
+m._test.set_mem(true, "sim")
+check("mem: simulated backend restored", m._test.mem_backend() == "sim",
+      m._test.mem_backend())
 
 return RESULTS

@@ -29,9 +29,11 @@ Requires numpy for the fast path; without it the search still runs, just slower.
 from __future__ import annotations
 
 import argparse
+import array
 import os
 import struct
 import sys
+import time
 
 # defaults from the module (NGB_Presentation.lua, OFF table)
 DEF_REC_BASE = 0x7B5C0
@@ -196,20 +198,27 @@ def plausible(data, base, side_stride, rec_stride, kind_stride=DEF_KIND,
     }
 
 
-def search(data, meta, verbose=True):
-    """Return a list of candidate layouts, best first."""
+def search(data, meta, verbose=False, max_scan_s=300.0,
+           idx_guesses=None, side_guesses=None):
+    """Find candidate layouts.
+
+    `idx_guesses` / `side_guesses` let a caller restrict the search (the
+    selftest does: proving that the pair which finds the real table does *not*
+    find it for a wrong score is a stronger statement than "nothing anywhere").
+    Returns a list of candidate layouts, best first.
+    """
     home = meta.get("home")
     away = meta.get("away")
     if home is None:
         home = away = None
 
-    idx_guesses = []
+    idx_guesses = list(idx_guesses or [])
     for cand in (meta.get("idx"), DEF_IDX, 0x2134, 0x2130, 0x2138, 0x2140,
                  0x2120, 0x2000, 0x2200):
         if cand and cand not in idx_guesses:
             idx_guesses.append(cand)
 
-    side_guesses = []
+    side_guesses = list(side_guesses or [])
     for cand in (meta.get("side"), DEF_SIDE, 0x59650, 0x58C00, 0x5A000, 0x60000):
         if cand and cand not in side_guesses:
             side_guesses.append(cand)
@@ -220,6 +229,7 @@ def search(data, meta, verbose=True):
     if G is not None:
         import numpy as np  # noqa: F401  (G came from numpy)
 
+    deadline = time.time() + max_scan_s
     for rec_stride in idx_guesses:
         # side strides that keep 40 records inside the file
         for side_stride in side_guesses:
@@ -232,11 +242,16 @@ def search(data, meta, verbose=True):
                 print("  trying rec_stride 0x%X  side_stride 0x%X" % (rec_stride, side_stride))
 
             if G is None:
-                bases = _bases_slow(data, side_stride, rec_stride, home)
+                bases = _bases_slow(data, side_stride, rec_stride, home, away,
+                                    deadline=deadline)
             else:
                 bases = _bases_fast(G, side_stride, rec_stride, home, away)
             if verbose:
                 print("    %d candidate base addresses" % len(bases))
+            if time.time() > deadline:
+                print("  scan budget (%ds) exhausted before all stride pairs were "
+                      "tried; narrow it with --max-scan or install numpy"
+                      % int(max_scan_s))
 
             for base in bases[:4000]:
                 got = side_totals(data, base, side_stride, rec_stride, K_GOALS)
@@ -299,23 +314,103 @@ def _bases_fast(G, side_stride, rec_stride, home, away):
     return [int(i) * 4 - DEF_KIND_OFF for i in np.nonzero(mask)[0]]
 
 
-def _bases_slow(data, side_stride, rec_stride, home):
-    out = []
+def _word_view(data):
+    """A 32-bit little-endian view of the dump, indexable by word.
+
+    `array` is in the standard library, so the slow path does not depend on
+    numpy - and indexing it is ~20x faster than struct.unpack_from per read,
+    which is what made this scan look like a hang without numpy.
+    """
     if data is None:
+        return None
+    n = len(data) - (len(data) % 4)
+    if n < 64:
+        return None
+    try:
+        words = array.array("I")
+    except (ValueError, TypeError):        # platform without a 32-bit int type
+        return None
+    if words.itemsize != 4:
+        return None
+    words.frombytes(data[:n])
+    if sys.byteorder != "little":
+        words.byteswap()
+    return words
+
+
+def _goal_slots(rec_stride, kind_stride=DEF_KIND, base_off=DEF_KIND_OFF,
+                buckets=DEF_BUCKETS):
+    """Word indices, relative to a record, of the goal buckets."""
+    start = base_off + K_GOALS * kind_stride
+    return [start // 4 + b for b in range(buckets)]
+
+
+def _bases_slow(data, side_stride, rec_stride, home, away=None, deadline=None):
+    """Every aligned offset whose 40-record goal sums hit the score.
+
+    Two stages, because the full check is 40 records x 2 sides:
+      1. cheap prune - the first bucket group of the first record has to be
+         <= home, which throws out almost every offset;
+      2. exact sum over all 40 records on both sides.
+    Nothing is approximated: a candidate that survives stage 2 has exactly
+    `home` goals for the home side and `away` for the away side.
+    """
+    out = []
+    words = _word_view(data)
+    if words is None:
         return out
-    limit = len(data) - (side_stride + 40 * rec_stride) - 0x40
+    if rec_stride <= 0 or rec_stride % 4 or side_stride % 4:
+        return out
+    rec_w = rec_stride // 4
+    side_w = side_stride // 4
+    slots = _goal_slots(rec_stride)
+    span = side_w + 40 * rec_w + 0x40
+    limit = len(words) - span
     if limit <= 0:
         return out
-    step = 4
-    for off in range(0, limit, step):
-        got = side_totals(data, off, side_stride, rec_stride, K_GOALS)
-        if got is None:
+    last_slot = slots[-1]
+    step = 1                                   # one word == 4 bytes
+    off = 1                                    # never base 0: that is a header
+    checked = 0
+    while off < limit:
+        if deadline is not None and (checked & 0x3FFF) == 0 and time.time() > deadline:
+            return out
+        checked += 1
+        # stage 1: first record, first bucket group
+        keep = True
+        got0 = 0
+        for si in slots:
+            v = words[off + si]
+            got0 += v
+            if got0 > (home if home is not None else 0xFFFFFFFF):
+                keep = False
+                break
+        if not keep:
+            off += step
             continue
-        if home is not None and got[0] != home:
+        # stage 2: both sides, all 40 records. Both totals only grow (every
+        # bucket is an unsigned count), so exceeding the scoreboard is a
+        # definitive miss - that is what keeps the no-match scan short.
+        hi = 0
+        ai = 0
+        over = False
+        for idx in range(40):
+            base = off + idx * rec_w
+            for si in slots:
+                hi += words[base + si]
+                ai += words[base + side_w + si]
+            if (home is not None and hi > home) or (away is not None and ai > away):
+                over = True
+                break
+        if over:
+            off += step
             continue
-        out.append(off)
-        if len(out) >= 2000:
-            break
+        ok = (home is None or hi == home) and (away is None or ai == away)
+        if ok:
+            out.append(off * 4)
+            if len(out) >= 2000:
+                break
+        off += step
     return out
 
 
@@ -374,6 +469,13 @@ def make_region(rec_base, side_stride, rec_stride, home_goals, away_goals,
     def putf(off, value):
         if 0 <= off <= size - 4:
             struct.pack_into("<f", buf, off, value)
+
+    # A real heap region is not a field of zeros: it is full of live counters.
+    # Filling the background first matters for two reasons - it makes the
+    # synthetic dump behave like a real one, and it gives the scan something to
+    # prune against instead of 1.6 MB of zeros that every candidate matches.
+    for off in range(0, size - 4, 4):
+        put(off, rnd.randint(0, 3) if rnd.random() < 0.5 else 0)
 
     # allocator header like the real region
     put(0, 0)
@@ -444,7 +546,11 @@ def selftest():
         cands2[0]["rec_base"] if cands2 else None,)))
 
     print("selftest: wrong score must find nothing")
-    cands3 = search(moved, Ca := {"home": 5, "away": 0}, verbose=False)
+    # Restricted to the stride pair that just found the table: if that exact
+    # pair cannot reproduce a wrong scoreboard, the match is real evidence, not
+    # a coincidence - and it keeps the selftest in seconds without numpy.
+    cands3 = search(moved, {"home": 5, "away": 0}, verbose=False,
+                    idx_guesses=[DEF_IDX], side_guesses=[DEF_SIDE])
     ok3 = len(cands3) == 0
     print("  %s" % ("PASS" if ok3 else "FAIL: %d false positives" % len(cands3)))
 
