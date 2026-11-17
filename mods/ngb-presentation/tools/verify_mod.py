@@ -1042,15 +1042,11 @@ def calibration_checks():
     check("calibration: decoder present", True)
     check("calibration: writes calibration.txt", "calibration.txt" in src)
     check("calibration: has a selftest", "--selftest" in src and "def selftest" in src)
-    try:
-        import numpy  # noqa: F401
-        have_np = True
-    except Exception:
-        have_np = False
-    if not have_np:
-        results.append(("calibration: selftest finds the layout", None,
-                        "pip install numpy"))
-        return
+    # The selftest must run WITHOUT numpy too: the pure-Python scan used to
+    # take minutes on a zero-filled synthetic dump, which is why this tool was
+    # documented for a long time but never actually exercised.
+    check("calibration: scan does not need numpy", "array" in src)
+    check("calibration: scan has a time budget", "max_scan_s" in src)
     try:
         out = subprocess.run([sys.executable, path, "--selftest"],
                              capture_output=True, text=True, timeout=300)
@@ -1060,6 +1056,7 @@ def calibration_checks():
     ok = out.returncode == 0 and out.stdout.count("PASS") >= 3
     tail = (out.stdout or out.stderr).strip().splitlines()
     check("calibration: selftest finds the layout", ok, tail[-1] if tail else "")
+    check("calibration: selftest reports no failure", "FAIL" not in out.stdout)
 
 
 def main():

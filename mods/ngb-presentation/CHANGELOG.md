@@ -405,7 +405,11 @@ and that the remaining dereferences happen in C behind `ReadProcessMemory`.
 * **In-game acceptance run.** Not performed — cannot be performed here.
 * **Per-player stat offsets for FL_2025.exe.** Still unproven, still off by
   default. `tools/decode_probe.py` + `calibration.txt` exist so you can pin the
-  layout without editing code.
+  layout without editing code. What *is* now proven: the tool runs end to end
+  (`--selftest` builds a synthetic region and finds the layout again, is part of
+  `verify_mod.py`, and no longer needs numpy — the pure-Python scan took minutes
+  on a zero-filled dump and now takes seconds). What is still missing is one
+  real `probe_region.bin` from your game.
 * **Exclusive fullscreen with the DLL.** Expected to work (it is the whole point
   of hooking Present) but unproven on your machine.
 * **Anti-cheat / online.** This is a single-player presentation mod. Do not use
