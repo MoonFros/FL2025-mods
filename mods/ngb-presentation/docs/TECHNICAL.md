@@ -53,29 +53,25 @@ int      NGB_VirtualProtect(void*, size_t, uint32_t, uint32_t*)
 
 ## 2. Data sources
 
-### 2.1 `ctx.mis` — `MATCH_INFO_STRUCT`
+The 1.1.0 rewrite sorts every source into three tiers, and only tier 1 is
+trusted unconditionally. The rule behind the whole design: **a number is either
+read from the game or it is not shown.**
 
-| Offset | Field |
-|--------|-------|
-| `+0x138` | home `TEAM_INFO_STRUCT` |
-| `+0x7C8` | away `TEAM_INFO_STRUCT` (stride `0x690`) |
-| team `+0x04` | `team_name[0x46]` (UTF‑8, NUL padded) |
-| team `+0x4A` | `team_abbr[4]` |
-| team `+0x5D8` | `SHIRTCOLOR_STRUCT players[2]` → `index, ?, color1[3], color2[3]` (kit colour) |
-| team `+0x150` | `u32 squad_id[40]` — roster order, **the stat record index** |
-| `+0x1078` / `+0x12D0` | `u8 xi_slot[11]` — squad index of the 11 players on the pitch |
+### Tier 1a. Sider's match library - `match.stats()`
 
-The XI list is used to map a squad index (which is what the stat block is keyed
-by) to a pitch position slot (`0..10` home, `11..21` away).
-
-### 2.2 `match.stats()` — `SCOREBOARD_INFO`
-
-`match.stats()` returns a *reused* table; values must be copied immediately.
-Fields: `ptr`, `home_score`, `away_score`, `pk_home_score`, `pk_away_score`,
-`period` (1 first half, 2 second, 3 ET1, 4 ET2, 5 shootout), `clock_minutes`,
+`match.stats()` is Sider's own reader for the game's scoreboard. It returns a
+*reused* table, so values are copied immediately. Available fields: `ptr`,
+`home_score`, `away_score`, `pk_home_score`, `pk_away_score`, `period`
+(1 first half, 2 second, 3 ET1, 4 ET2, 5 shootout), `clock_minutes`,
 `clock_seconds`, `added_minutes`.
 
-Extra fields read from `ptr`:
+It only exists when `sider.ini` contains `match-stats.enabled = 1`; the module
+checks the ini at `init`, reports `ENGINE OFF -> add match-stats.enabled = 1`
+in the Sider overlay when the line is missing, and keeps working in
+hook-only mode otherwise.
+
+Extra fields the module reads from the returned `ptr` (verified against the
+Sider source, not guessed):
 
 | Offset | Field |
 |--------|-------|
@@ -84,82 +80,124 @@ Extra fields read from `ptr`:
 | `+0x38` | `SCOREBOARD_INFO2*` |
 | `+0x120` / `+0x124` | home / away score |
 | `+0x12C` / `+0x130` | clock minutes / seconds |
-| `+0x144` | added minutes |
-| sci2 `+0x88` | `match_stage` — `0x05` live, `0x0C` kick‑off, `0x10` shootout |
+| `+0x138` / `+0x144` | injury time flag / added minutes |
+| sci2 `+0x88` | `match_stage` - `0x05` live, `0x0C` kick-off, `0x10` shootout |
 
-### 2.3 Per‑player stat block (private heap region `0x190000`)
+`m.refresh_match()` runs at 5 Hz, writes `m.eng.home/away/clock/period` and
+stamps `m.eng.last_ok`. `m.data_source()` returns `"sider"` while that stamp is
+younger than 4 s, else `"none"` - so the HUD can say plainly whether the engine
+is talking.
 
-The engine keeps a dedicated private region of exactly `0x190000` bytes whose
-first 12 bytes are the allocator header `{ 0, 0x18FFE0, 1 }` (`u32` ×3). It is
-found with `VirtualQuery` + header comparison (`m.scan_regions`).
+### Tier 1b. Sider's goal hook - `goal_scored`
+
+```
+{ player_id, player_offset, home_or_away, player_name_on_shirt }
+```
+
+This is the only event in the whole Sider API that carries a player, and it fires
+on the frame a goal is scored. `m.on_goal_scored` stores
+`m.goal_hook = { side, pid, name, minute, at }` and `m.goal_from_hook()` turns it
+into a `goal` event carrying `player_known = true`, the shirt name, the minute
+from the scoreboard clock and the score line.
+
+Consequences that are *by design*:
+
+* the hook cannot report shots, assists or saves - Sider has no such event, so
+  the mod never claims shots from it;
+* when the hook does not fire, the card is drawn **unnamed** (`DrawGoalBare`)
+  rather than attaching the goal to a guessed player.
+
+### Tier 1c. Scoreboard fallback - `watch_scoreboard`
+
+A 5 Hz watcher compares the scoreboard total with the last one it saw:
+
+* score jumped and a hook arrived within the same tick → hook card (named);
+* score jumped with no hook → `goal_fallback`: an unnamed card with the minute
+  and the new score line, which still starts the replay window;
+* score went *backwards* (a goal disallowed by VAR/replay) → the tally and the
+  scorer list are re-baselined, and nothing is announced.
+
+`watch_period` does the same for the period field: period 1 → 2 raises a
+`half_time` result card, period → 5 marks the shootout, and the clock stopping at
+or after 90' (120' with extra time) raises a `full_time` card.
+
+The mod also keeps its own goal log: `m.eng.goal_log[] = { name, side, minute,
+kind }`, used for the half/full-time scorer list and for per-player tallies
+(brace / hat-trick), so a milestone count is a count of goals actually seen, not
+an estimate.
+
+### Tier 2. The per-player statistics table - off until it validates
+
+Shots, shots on target, passes, ratings, assists and engine minutes live in a
+per-player table in the game's private heap. **Its location is build-specific.**
+The previous version trusted a fixed layout and produced `0 shots / 0 min /
+id #0` for every scorer on builds where the layout had moved. 1.1.0 keeps the
+reader but treats the layout as a *candidate*:
+
+```ini
+experimental_player_stats = 0   ; must be 1 before the reader is even polled
+probe_enabled = 0               ; writes probe.txt with the raw evidence
+```
+
+The candidate layout (private region of `0x190000` bytes, allocator header
+`{0, 0x18FFE0, 1}`):
 
 ```
 record(side, idx) = region + 0x7B5C0 + side*0x59650 + idx*0x2134
-stat kind k       = record + 0x08 + k*0x24,   8 × u32 (one bucket per period)
+stat kind k       = record + 0x08 + k*0x24,   8 x u32 (one bucket per period)
 value(k)          = words[0..7] summed
 ```
 
-Stat kinds used (the full table has ~0xB0 entries):
+Stat kinds used: 0 goals, 1 own goals, 3 penalty goals, 4 assists, 6 shots,
+17 shots on target, 22/23 passes/completed, 55 fouls, 57/58 cards, 67 touches,
+133 GK saves, 179 official rating (`word[0]` as `f32`).
 
-| kind | meaning | kind | meaning |
-|------|---------|------|---------|
-| 0 | goals | 49 | tackles |
-| 1 | own goals | 50 | tackles won |
-| 2 | free‑kick goals | 54 | clearances |
-| 3 | penalty goals | 55 | fouls |
-| 4 | **assists** | 56 | offsides |
-| 6 | **shots** | 57 | yellow cards |
-| 12 | shots (engine "success") | 58 | red cards |
-| 17 | **shots on target** | 63 | corners |
-| 21 | penalty shots | 65 / 66 | dribbles / completed |
-| 22 / 23 | passes / completed | 67 | touches |
-| 133 | GK saves | 78 | interceptions |
-| **179** | **official match rating** — `word[0]` as IEEE‑754 `f32` (4.0–9.5) | 86 | blocks |
+`m.validate_stats()` decides whether the table is real, and is the only thing
+that can switch tier 2 on:
 
-Two more values in the same region: the match‑time counter at `+0x7B518` and the
-possession pair at `+0x181A10` / `+0x181A14`.
+| Check | Rule |
+|-------|------|
+| readable | at least 20 players give plausible values |
+| ordering | per player `shots >= on_target` |
+| bounds | goals / assists / passes within sane ranges |
+| coverage | `Σ goals + own goals >= scoreboard goals + PK goals` |
+| coverage | `Σ shots >= scoreboard goals + PK goals` |
 
-> The engine's own ratings (`kind 179`) are used when they read back inside
-> `[1.0, 10.0]`; otherwise the module computes a composite rating from goals,
-> assists, shot accuracy, pass %, tackles, dribbles, saves and touches.
+Until it passes, `m.player_stats_ok()` is false and the HUD draws no stat cells
+at all. It re-validates every 5 s until it passes, then every 30 s (a table that
+stops making sense goes back off by itself).
 
-### 2.4 Pitch positions (private heap region `0xF0000`)
+### Tier 3. Pitch positions (used only with tier 2)
 
-A second private region of `0xF0000` bytes with header `{ 0, 0xEFFE0, 1 }`.
-At `region + 0x253FC` there are **22 × `f32[3]`** = `(x, y, z)` in metres from
-the centre spot (`x ∈ [-52.5, 52.5]`, `y ∈ [-34, 34]`), entries `0..10` = home
-XI by formation slot, `11..21` = away XI by formation slot.
+A second private region (`0xF0000` bytes, header `{0, 0xEFFE0, 1}`) holds
+22 x `f32[3]` at `+0x253FC`: `(x, y, z)` in metres from the centre spot,
+`0..10` home XI by formation slot, `11..21` away. Gate: 16 of 22 entries must
+satisfy `|x| <= 70, |y| <= 45, -2 <= z <= 25`. Shot distance and angle are
+derived from the shooter's real position, so they inherit tier 2's gating.
 
-Sanity gate: at least 16 of the 22 entries must satisfy
-`|x| ≤ 70, |y| ≤ 45, -2 ≤ z ≤ 25`, otherwise the block is treated as
-"not ready" and the telemetry falls back to an estimated origin.
-
-Attack direction: the home keeper's `x` (`|x| ≥ 25`). `x < 0` ⇒ home attacks the
-`+52.5` goal.
-
-### 2.5 Companion hand-off
+### Companion hand-off
 
 `state.json` is the only interface between Lua and the HUD. The module starts
 `ngb-overlay\NGB_Overlay.exe` once per session (`auto_launch_companion`),
 preferring `WinExec` over FFI (instant, no console flash) and falling back to
-`io.popen('start "" …')`. The HUD resolves `state.json` relative to its own
+`io.popen('start "" ...')`. The HUD resolves `state.json` relative to its own
 folder (`..\content\ngb-presentation\state.json`, with fallbacks), so it keeps
 working whether it sits in `ngb-overlay\`, `overlay\` or the repo root.
 
-### 2.6 `Player.bin` (`common\etc\pesdb\Player.bin`)
+### `Player.bin` (`common\etc\pesdb\Player.bin`)
 
-WESYS container: `00 01 01 "WESYS"` + `u32 compressed_size` + `u32`
-`uncompressed_size` + zlib payload. Decompressed records are **312 bytes**:
+WESYS container: `00 01 01 "WESYS"` + `u32 compressed_size` +
+`u32 uncompressed_size` + zlib payload. Decompressed records are **312 bytes**:
 
 | Offset | Field |
 |--------|-------|
 | `+8` | `u32 player_id` |
-| `+27` | bits: 8 wide, `+100` → height (cm) |
-| `+44` | bits: shift 6, 6 wide, `+40` → kicking power (40–99) |
-| `+49` | bits: shift 4, 6 wide, `+40` → finishing |
-| `+54` | bits: shift 2, 4 wide → registered position code (0 GK, 1 CB, 2 LB, 3 RB, 4 DMF, 5 CMF, 6 LMF, 7 RMF, 8 AMF, 9 LWF, 10 RWF, 11 SS, 12 CF) — *best effort, ~78 % exact* |
+| `+27` | bits: 8 wide, `+100` -> height (cm) |
+| `+44` | bits: shift 6, 6 wide, `+40` -> kicking power (40-99) |
+| `+49` | bits: shift 4, 6 wide, `+40` -> finishing |
+| `+54` | bits: shift 2, 4 wide -> registered position code |
 | `+129` | shirt number |
-| `+251` | name, 60 bytes UTF‑8 |
+| `+251` | name, 60 bytes UTF-8 |
 
 Captured once, on the `livecpk_data_ready` event for `Player.bin`, and decoded
 with Sider's own `zlib.unpack`.
@@ -168,38 +206,36 @@ with Sider's own `zlib.unpack`.
 
 ## 3. Detection logic
 
-`display_frame` drives a throttled tick:
+`display_frame` drives a throttled tick (8 ms floor):
 
 ```
-every 200 ms   refresh match info (score, clock, stage) + team names / XI
-every 6000 ms  (until found, max 3 tries) region discovery
-every ~120 ms  read the 22 pitch positions
-every ~350 ms  read 18 stat kinds for all 40 players of both sides
-every ~100 ms  rewrite state.json
+every 200 ms   refresh_match(): scoreboard score, clock, period, stage, teams
+every 200 ms   watch_scoreboard() + watch_period(): goals, HT, FT, shootout
+every 200 ms   refresh_match reads the scoreboard through match.stats()
+every 120 ms   pitch positions                      (tier 2 only)
+every 350 ms   per-player stat kinds                (tier 2, validated only)
+every 5 s      tier-2 validation while not yet passed, then every 30 s
+every 100 ms   rewrite state.json (state_write_hz = 10)
 ```
 
-Each stat poll reads one contiguous `0x288`‑byte window per player (kinds 0–17)
-with a single `ReadProcessMemory`, then compares `goals / own goals / assists /
-shots / shots on target` with the previous snapshot. Priority per poll:
-**goal > own goal > shot**. The first successful poll only establishes a
-baseline (so starting the mod mid‑match never fires a burst of fake events).
+Goal flow in full:
 
-* goal (`kind 0` ↑) → goal event, `outcome = "goal"`, also starts the replay
-  camera window. The card itself is held back by `goal_telemetry_delay`
-  (default 1.2 s) so it lands as the replay starts; the delay is stored on the
-  event as `show_at` and does not shorten the card's lifetime.
-* own goal (`kind 1` ↑) → goal event, `outcome = "own_goal"`, aimed at the
-  scorer's *own* net.
-* shot (`kind 6` ↑, no goal) → shot event; `outcome = "on_target"` when
-  `kind 17` rose in the same poll, else `"off_target"`.
+```
+goal_scored hook ─┐
+                  ├─> m.goal_hook / m.goal_fallback ─> event(kind="goal",
+scoreboard jump ──┘                                      show_at = now + delay,
+                                                         player_known = …)
+                                                              │
+                                     DrawGoalCard (stats) or DrawGoalBare
+```
 
-The `goal_scored` Sider event is used as a fallback when the stat region has not
-been located yet (name comes from the payload's `player_name_on_shirt`).
+The card is held back by `goal_telemetry_delay` (1.2 s default) so it lands as the
+replay starts; the delay lives on the event as `show_at` and does not shorten the
+card's lifetime. Starting the mod mid-match never fires a burst: the first
+scoreboard read only establishes a baseline.
 
-Post‑match: the MOTM card is armed by either
-`livecpk_data_ready` → `MatchSetupRematch.json`, or the clock stopping at/after
-90′ (120′ when `period ≥ 3`, i.e. extra time) with `is_clock_running == 0`;
-the card appears 2.6 s later.
+Every tick writes `status.clock` and `status.data.source`, so the overlay and the
+Sider overlay agree on whether the engine is talking.
 
 ---
 
@@ -383,87 +419,109 @@ Other mods and settings are untouched.
 
 ## 6. `state.json`
 
-Written to `content\ngb-presentation\state.json` at `state_write_hz` (10 Hz).
-Small (~1.5 KB) so a reader can never be more than one frame behind.
+Written to `content\ngb-presentation\state.json` at `state_write_hz` (10 Hz),
+about 2 KB, so a reader is never more than one tick behind. Schema version **3**.
 
 ```json
 {
-  "v": 2, "seq": 842, "ts": 918273,
-  "module": "Next-Gen Broadcast", "version": "1.0.1",
+  "v": 3, "seq": 842, "ts": 918273,
+  "module": "Next-Gen Broadcast", "version": "1.1.0",
   "hud": { "enabled": true, "master": true, "style": 0, "analysis": true,
-           "units": "metric", "scorebug": false,
+           "units": "metric", "scorebug": true,
            "credit": "MOONFROS PRESENTS", "author": "MoonFros",
            "tagline": "Next-Gen Football Broadcast Presentation",
            "toast": { "text": "HAT-TRICK  |  B. SAKA", "kind": "milestone",
                       "seq": 12, "hold": 4.5 } },
-  "status": { "ffi": true, "stats_region": true, "pitch_region": true,
-              "camera": true, "player_db": true, "names": "Player.bin",
-              "events": 17, "overlay_visible": true,
-              "style": 0, "analysis": true },
+  "status": {
+    "ffi": true, "stats_region": false, "pitch_region": false,
+    "camera": true, "player_db": true, "names": "Player.bin",
+    "events": 17, "overlay_visible": true, "style": 0, "analysis": true,
+    "data": { "scoreboard": "sider", "clock": "sider", "player_stats": false,
+              "scorer_hook": true, "match_stats_ini": true,
+              "shots": 0 }
+  },
   "match": { "clock": "72:14", "period": 2, "stage": 5, "live": true,
+             "score_line": "ARS 2 - 1 CHE", "pk_home": 0, "pk_away": 0,
              "home": { "name": "ARSENAL", "abbr": "ARS", "score": 2, "color": "#EF0107" },
              "away": { "name": "CHELSEA", "abbr": "CHE", "score": 1, "color": "#034694" } },
+  "scorers": [ { "name": "B. SAKA", "side": "home", "minute": 12, "kind": "goal" },
+               { "name": "K. HAVERTZ", "side": "home", "minute": 55, "kind": "goal" },
+               { "name": "C. PALMER", "side": "away", "minute": 61, "kind": "goal" } ],
   "event": {
-    "id": 17, "kind": "goal", "remaining": 12.4, "duration": 13, "side": "home",
+    "id": 17, "kind": "goal", "remaining": 0, "duration": 13, "show_at": 918000,
+    "side": "home", "minute": 55, "player_known": true,
+    "score_line": "ARS 2 - 1 CHE", "detail": "goal",
     "player": { "name": "B. SAKA", "shirt": 7, "pos": "RWF", "rating": 8.4,
                 "minutes": 68, "minutes_exact": true },
     "team":   { "name": "ARSENAL", "abbr": "ARS", "color": "#EF0107" },
-    "stats":  { "shots": 4, "on_target": 3, "goals": 3, "assists": 1, "ga": 4 },
-    "milestone": { "key": "hat_trick", "label": "HAT-TRICK", "tone": "gold" },
-    "assist":    { "name": "M. ODEGAARD", "shirt": 8 },
-    "shot":   { "speed_kmh": 119.4, "speed_mph": 74.2, "speed_source": "modelled",
+    "tally":  { "goals": 2 },
+    "milestone": { "key": "brace", "label": "BRACE", "tone": "gold" },
+    "score":  { "home": 2, "away": 1 },
+    "stats":  { "shots": 4, "on_target": 3, "goals": 2, "assists": 1, "ga": 3 },
+    "shot":   { "speed_kmh": 119.4, "speed_source": "modelled",
                 "distance_m": 16.8, "distance_yd": 18.4, "distance_source": "measured",
-                "angle_deg": 22.6, "elevation_deg": 8.4, "apex_m": 1.9, "apex_ft": 6.2,
-                "hang_s": 0.92, "xg": 0.24, "outcome": "goal", "body": "right_foot",
-                "source": "measured", "target_x": 1.2, "target_y": 1.4,
-                "origin_x": 36.0, "origin_y": 9.0,
-                "traj": [[36.0, 9.0, 0.0], "..."] }
+                "angle_deg": 22.6, "xg": 0.24, "outcome": "goal", "source": "measured" }
   }
 }
 ```
 
-`event.kind` is `"goal"`, `"shot"` or `"motm"`; the block is absent when nothing
-is on screen. `event.remaining` is `0` while a goal card is held back by
-`goal_telemetry_delay`, so the overlay does not pop the card early. MOTM events
-add `event.motm = { score_line, stats: {…} }` with passes, pass %, tackles,
-dribbles, touches, saves, interceptions, peak_mph and xg.
+Event kinds and their guarantees:
 
-> `speed_*` is always `"modelled"` (FL25 exposes no measured ball speed) while
-> `distance_*` is `"measured"` whenever the shooter's real position was
-> available. The overlay prints `~` in front of modelled numbers and states it in
-> the card footer - nothing modelled is ever presented as measured.
+| `event.kind` | When | Always present | Conditional |
+|---|---|---|---|
+| `goal` | hook or scoreboard jump | `minute`, `score_line`, `score`, `side`, `milestone`, `tally` | `player` + `stats` + `shot` only when `player_known` **and** tier 2 validated |
+| `fulltime` | period change / clock stop | `result` (`half_time` / `full_time`), `score_line`, `scorers[]` | `pk` in a shootout |
+| `shot` | tier 2 only | - | everything: shots, on/off target, telemetry |
+| `motm` | full time, tier 2 only | `motm.score_line` | full stat block |
 
-`event.kind` is `"goal"`, `"shot"` or `"motm"`; `event` is absent when nothing is
-on screen. MOTM events add `event.motm = { score_line, stats: {…} }` with passes,
-pass %, tackles, dribbles, touches, saves, interceptions, peak_mph and xg.
+A `goal` event with `player_known = false` is drawn by `DrawGoalBare`: "GOAL",
+the minute, the score line and "SCORER NOT AVAILABLE". That is deliberate - the
+alternative is the v1.0.1 behaviour, which printed a plausible-looking player
+with zeros.
+
+`scorers[]` is the mod's own goal log and is what the half-time and full-time
+cards read.
+
+> `speed_*` is always `"modelled"` (FL25 exposes no measured ball speed);
+> `distance_*` is `"measured"` only when the shooter's real pitch position was
+> available. The overlay prints `~` in front of modelled numbers and says so in
+> the card footer.
 
 The HUD animates from `event.remaining`, not from wall clocks, so a 10 Hz writer
-never stutters the cards.
+never stutters the cards. `event.remaining` stays `0` while `show_at` is in the
+future, which is how a goal card is held back for the replay without the overlay
+popping it early.
 
 ---
 
-## 7. Re‑calibration guide
+## 7. Calibrating tier 2 on a new build
 
-If a future game build moves things, `debug_log = 1` tells you exactly what was
-found. Order of attack:
+`experimental_player_stats` and `probe_enabled` are the whole toolchain; there is
+no manual address hunting required to *start*, and no guessing ever reaches the
+screen.
 
-1. **Stats / pitch regions** — pinned with 12‑byte headers. If the scan fails,
-   the header changed. Find the new header/offset with a memory scanner, update
-   `REGION_STATS_SIZE`, `OFF.REC_BASE`, `OFF.PITCH_BLOCK` in
-   `NGB_Presentation.lua`. You can also pin the base addresses directly:
+1. Set both keys to `1` in `NGB_Presentation.ini`, start a match.
+2. `content\ngb-presentation\probe.txt` is written on every goal and on the
+   diagnostics hotkey: scoreboard values (score, clock, period, stage), a
+   hexdump of the scoreboard block, and the private regions found by the
+   `VirtualQuery` header scan. `sider.log` carries the same lines prefixed
+   `[NGB]`.
+3. The overlay's F11 diagnostics panel prints the tier-2 verdict line
+   (`PLAYER DATA ok/off`, plus why it failed).
+4. If the table moved, update the candidate constants in
+   `NGB_Presentation.lua`: `REGION_STATS_SIZE`, `OFF.REC_BASE`, `OFF.REC_STRIDE`,
+   `OFF.SIDE_STRIDE`, `KIND`. The base can also be pinned directly:
    ```ini
    stats_region_base = 0x7E0000
    pitch_region_base = 0x7B0000
    ```
-2. **Stat kinds** — if shots no longer rise, the `KIND` table changed; the
-   engine exposes ~0xB0 kinds and the mapping is in the table at the top of the
-   file.
-3. **Replay camera** — add/replace a pattern in `CAM_PATTERNS` (literal bytes +
-   `check()` returning the float offset relative to the match start + the
-   expected default). The scan validates the value, so a wrong pattern is
-   harmless: it simply finds nothing.
-4. **Player.bin** — if names stop resolving, verify the WESYS magic and the
-   312‑byte record size; the field offsets live in the `P.*` constants.
+5. Restart, score a goal. When validation passes, the stat row appears on goal
+   cards by itself and the shot/miss/save cards start firing.
+
+Replay camera (unrelated to tier 2): add or replace a pattern in `CAM_PATTERNS`
+(literal bytes plus a `check()` that returns the float offset and the expected
+default). A wrong pattern is harmless - it finds nothing and the camera is left
+untouched.
 
 ---
 

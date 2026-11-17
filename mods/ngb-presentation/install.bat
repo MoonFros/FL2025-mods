@@ -134,19 +134,27 @@ if errorlevel 1 goto ini_manual
 
 findstr /i /c:"NGB_Presentation.lua" "%SIDER%\sider.ini" >nul 2>&1
 if errorlevel 1 goto ini_manual
+findstr /i /c:"match-stats.enabled" "%SIDER%\sider.ini" >nul 2>&1
+if errorlevel 1 (
+    echo  [!] sider.ini has no match-stats.enabled line - the live score and
+    echo      clock need it. Adding it with the clipboard fallback.
+    goto ini_manual
+)
 goto ini_ok
 
 :ini_manual
 echo.
 echo  ------------------------------------------------------------------
 echo   Could not edit sider.ini automatically.  It is now open in Notepad
-echo   and the two lines are on your clipboard: click at the END of the
+echo   and these three lines are on your clipboard: click at the END of the
 echo   file, press Ctrl+V, then Ctrl+S.
 echo.
 echo              luajit.ext.enabled = 1
+echo              match-stats.enabled = 1
 echo              lua.module = "NGB_Presentation.lua"
 echo  ------------------------------------------------------------------
 > "%TEMP%\ngb_lines.txt" echo luajit.ext.enabled = 1
+>> "%TEMP%\ngb_lines.txt" echo match-stats.enabled = 1
 >> "%TEMP%\ngb_lines.txt" echo lua.module = "NGB_Presentation.lua"
 type "%TEMP%\ngb_lines.txt" | clip
 start "" notepad "%SIDER%\sider.ini"

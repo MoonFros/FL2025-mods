@@ -7,7 +7,7 @@ FL 2025 community. Every mod lives in its **own self-contained folder** under
 | Mod | Folder | What it does |
 |-----|--------|--------------|
 | **EA FC 27 HyperMotion Broadcast** | [`mods/fc27-broadcast`](mods/fc27-broadcast) | EA FC style goal‑replay camera sweep, live goal/shot telemetry cards, per‑player popup and post‑match MOTM card, drawn by a transparent click‑through HUD |
-| **Next‑Gen Football Broadcast** (MOONFROS PRESENTS) | [`mods/ngb-presentation`](mods/ngb-presentation) | Broadcast presentation layer: player spotlights, animated goal analysis with trajectory, milestone call‑outs (brace / hat‑trick / assist), live performance tracker, gold Man of the Match reveal, three presentation styles — one‑click `install.bat` / `uninstall.bat` |
+| **Next‑Gen Football Broadcast** (MOONFROS PRESENTS) | [`mods/ngb-presentation`](mods/ngb-presentation) | Broadcast presentation layer on Sider's own match library and goal hook: goal cards with the real scorer and minute, half‑time / full‑time score cards, live score bug, milestone call‑outs, three presentation styles; per‑player stats and shot telemetry once the tier‑2 table is calibrated — one‑click `install.bat` / `uninstall.bat` |
 
 ---
 
@@ -64,5 +64,5 @@ Rules that keep mods independent:
 
 * `mods/fc27-broadcast` — v1.0.0, 145/145 offline checks passing
   (`python3 mods/fc27-broadcast/tools/verify_mod.py`).
-* `mods/ngb-presentation` — v1.0.1, 239/239 offline checks passing
+* `mods/ngb-presentation` — v1.1.0, 284/284 offline checks passing
   (`python3 mods/ngb-presentation/tools/verify_mod.py`).

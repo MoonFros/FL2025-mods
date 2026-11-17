@@ -28,8 +28,8 @@ m.NAME = "Next-Gen Broadcast"
 m.AUTHOR = "MoonFros"
 m.BRAND = "MOONFROS PRESENTS"
 m.TAGLINE = "Next-Gen Football Broadcast Presentation"
-m.VERSION = "1.0.1"
-m.STATE_VERSION = 2
+m.VERSION = "1.1.0"
+m.STATE_VERSION = 3
 
 -- ============================================================================
 -- 0. Optional LuaJIT FFI
@@ -204,7 +204,7 @@ local DEFAULT_CFG = {
     auto_launch_companion = 1,
     state_write_hz = 10,
     debug_log = 0,
-    show_scorebug = 0,
+    show_scorebug = 1,
     show_position = 1,
     credit_line = 1,
 
@@ -232,6 +232,13 @@ local DEFAULT_CFG = {
 
     motm_card_enabled = 1,
     motm_card_duration = 20.0,
+    -- half time / full time score cards (they only need the scoreboard)
+    result_card_enabled = 1,
+    result_card_duration = 9.0,
+    -- the per-player memory scan is experimental and off until it proves itself
+    experimental_player_stats = 0,
+    -- write a calibration dump (region map + scoreboard hexdump) to probe.txt
+    probe_enabled = 0,
 
     stats_poll_ms = 350,
     position_poll_ms = 120,
@@ -531,6 +538,8 @@ m.match = {
     mis = 0,
     sci = 0,
     sci2 = 0,
+    pk_home = 0,
+    pk_away = 0,
     seq = 0,        -- increments on every new match
 }
 
@@ -633,11 +642,14 @@ end
 
 function m.refresh_match(force)
     local ctx = m.ctx
-    if ctx == nil then return end
+    local now = now_ms()
 
-    local mis = m.ptr_num(ctx.mis)
-    if mis then
-        if mis ~= m.match.mis then
+    -- MATCH_INFO (ctx.mis) is not part of the documented context table, so it
+    -- is only a bonus: when it is missing nothing breaks, the names simply
+    -- stay empty instead of being invented.
+    if ctx and ctx.mis then
+        local mis = m.ptr_num(ctx.mis)
+        if mis and mis ~= m.match.mis then
             m.match.mis = mis
             m.match.home.color = nil
             m.match.away.color = nil
@@ -646,9 +658,15 @@ function m.refresh_match(force)
         end
     end
 
+    -- ---- scoreboard (this is the source of truth) -------------------------
     local st = nil
-    if match and match.stats then st = match.stats() end
+    if match and match.stats then
+        m.eng.lib = true
+        st = match.stats()
+    end
     if st then
+        m.eng.ok = true
+        m.eng.last_ok = now
         if st.ptr then
             local sci = m.ptr_num(st.ptr)
             if sci and sci ~= m.match.sci then
@@ -656,16 +674,37 @@ function m.refresh_match(force)
                 m.match.sci2 = m.read_u64(sci + OFF.S_SCI2) or 0
             end
         end
-        m.match.home.score = st.home_score or m.match.home.score
-        m.match.away.score = st.away_score or m.match.away.score
-        m.match.clock_min = st.clock_minutes or 0
-        m.match.clock_sec = st.clock_seconds or 0
-        m.match.added = st.added_minutes or 0
-        m.match.period = st.period or 0
+        m.eng.score.home = tonumber(st.home_score) or m.eng.score.home
+        m.eng.score.away = tonumber(st.away_score) or m.eng.score.away
+        m.match.clock_min = tonumber(st.clock_minutes) or 0
+        m.match.clock_sec = tonumber(st.clock_seconds) or 0
+        m.match.added = tonumber(st.added_minutes) or 0
+        m.match.period = tonumber(st.period) or 0
+        m.match.pk_home = tonumber(st.pk_home_score) or 0
+        m.match.pk_away = tonumber(st.pk_away_score) or 0
         m.match.valid = true
+        if (now - m.eng.last_ok) < 1 then
+            -- first successful read after a gap: treat as the new baseline
+        end
     end
 
-    refresh_teams_periodic(now_ms())
+    -- scores on screen: the scoreboard while it is alive, otherwise what the
+    -- goal hook counted. never both, so nothing is counted twice.
+    if m.eng.ok and (now - m.eng.last_ok) < 4000 then
+        m.match.home.score = m.eng.score.home
+        m.match.away.score = m.eng.score.away
+        if m.eng.pending_side ~= nil then
+            local caught = (m.eng.pending_side == 0)
+                          and (m.eng.score.home > (m.eng.prev.home or 0))
+                          or  (m.eng.pending_side == 1 and m.eng.score.away > (m.eng.prev.away or 0))
+            if caught then m.eng.pending_side = nil end
+        end
+    else
+        m.match.home.score = m.tally_score.home
+        m.match.away.score = m.tally_score.away
+    end
+
+    refresh_teams_periodic(now)
 
     local sci = m.match.sci
     if sci and sci ~= 0 then
@@ -691,6 +730,79 @@ function m.clock_str()
         s = s .. "+" .. tostring(m.match.added)
     end
     return s
+end
+
+-- ============================================================================
+-- 7b. Engine truth  (Sider match library + goal_scored hook)
+--
+--  This is the part that cannot be wrong: Sider itself reads the scoreboard and
+--  the goal hook straight out of the game, so whatever arrives here is real.
+--  Everything the HUD shows as a hard number comes from this section.  The old
+--  per-player scan (sections 9-11) is experimental, off by default, and its
+--  numbers are only published after they pass a sanity check.
+-- ============================================================================
+m.eng = {
+    lib = false,          -- this Sider build exposes match.stats()
+    ok = false,           -- ... and it returned a table at least once
+    ini_ok = nil,         -- sider.ini contains match-stats.enabled = 1
+    last_ok = 0,
+    score = { home = 0, away = 0 },
+    prev = { home = 0, away = 0, period = -1 },
+    goals = 0,
+    last_goal_at = 0,
+    pending_side = nil,
+    pending_until = 0,
+    last_goal_name = "",
+}
+m.scorers = {}            -- every goal of the current match, in order
+m.tally_score = { home = 0, away = 0 }
+m.tally = {}              -- per player goals, counted from the hook
+
+-- sider.ini tells us whether the match library was switched on. install.bat
+-- adds the line; if the mod was dropped in by hand the answer is visible here.
+function m.check_ini_flags()
+    local sdir = (m.ctx and m.ctx.sider_dir) or nil
+    if not sdir then return end
+    local f = io.open(sdir .. "sider.ini", "r")
+    if not f then return end
+    local txt = f:read("*a") or ""
+    f:close()
+    local on = string.find(txt, "match%-stats%.enabled%s*=%s*1") ~= nil
+    m.eng.ini_ok = on
+    if not on then
+        log_once("msini",
+            "sider.ini has no 'match-stats.enabled = 1' - the live score and clock will read 0. " ..
+            "install.bat adds it for you; by hand it is one line, then restart the game.", 120000)
+    end
+    if string.find(txt, "luajit%.ext%.enabled%s*=%s*1") == nil then
+        log_once("ljini", "sider.ini has no 'luajit.ext.enabled = 1' - FFI extras stay off.", 120000)
+    end
+end
+
+local function clean_name(str)
+    if type(str) ~= "string" then return "" end
+    str = string.gsub(str, "[%z\1-\31\127]", "")
+    str = string.gsub(str, "^%s+", "")
+    str = string.gsub(str, "%s+$", "")
+    if #str > 22 then str = string.sub(str, 1, 22) end
+    return str
+end
+m.clean_name = clean_name
+
+-- score that should be on screen right now: the engine's, or (for the moment
+-- between the goal hook firing and the scoreboard catching up) that plus one
+local function current_score()
+    local h, a = m.match.home.score or 0, m.match.away.score or 0
+    if m.eng.pending_side and now_ms() < (m.eng.pending_until or 0) then
+        if m.eng.pending_side == 0 then h = h + 1 else a = a + 1 end
+    end
+    return h, a
+end
+m.current_score = current_score
+
+function m.data_source()
+    if m.eng.ok and (now_ms() - (m.eng.last_ok or 0)) < 4000 then return "sider" end
+    return "none"
 end
 
 -- ============================================================================
@@ -871,6 +983,47 @@ local function apply_region_override()
         log_msg("pitch region (INI) @ " .. hex(p))
     end
     m.reg.ok = (m.reg.stats ~= 0)
+end
+
+-- ============================================================================
+-- 9b. Is the per-player scan actually telling the truth?
+--
+--  A guessed offset that happens to be readable still returns zeros, and zeros
+--  on a card are worse than no card at all.  Before any of it is used, the
+--  numbers have to agree with the game: twenty-two readable players, shots at
+--  least as many as shots on target, and a goal total that covers the
+--  scoreboard.  Anything else and the HUD falls back to scoreboard-only cards.
+-- ============================================================================
+m.stats_validated = false
+m.stats_checked_at = 0
+
+function m.player_stats_ok()
+    if cfg_i("experimental_player_stats", 0) == 0 then return false end
+    if not m.reg or (m.reg.stats or 0) == 0 then return false end
+    return m.stats_validated == true
+end
+
+function m.validate_stats()
+    if (m.reg.stats or 0) == 0 then return false end
+    local players, goals, shots = 0, 0, 0
+    for side = 0, 1 do
+        for idx = 0, 10 do
+            local r = m.read_player_stats(side, idx)
+            if r then
+                players = players + 1
+                if r.shots < r.on_target then return false end
+                if r.goals > 12 or r.shots > 60 or r.passes > 400 then return false end
+                goals = goals + r.goals + r.own_goals
+                shots = shots + r.shots
+            end
+        end
+    end
+    if players < 20 then return false end
+    local board = (m.eng.score.home or 0) + (m.eng.score.away or 0)
+               + (m.match.pk_home or 0) + (m.match.pk_away or 0)
+    if goals < board then return false end
+    if shots < board then return false end
+    return true
 end
 
 -- ============================================================================
@@ -1556,6 +1709,91 @@ m.units_dist = units_dist
 m.units_height = units_height
 
 -- ============================================================================
+-- 14b. Calibration probe
+--
+--  Off by default.  When switched on in the .ini it writes
+--  content\\ngb-presentation\\probe.txt: the scoreboard as Sider reports it,
+--  a hexdump of the SCOREBOARD_INFO block, and a map of the game's committed
+--  memory regions.  That is everything needed to pin the per-player table of a
+--  specific FL_2025.exe build down, instead of guessing at offsets.
+-- ============================================================================
+local function hexdump(buf, len, base)
+    local out = {}
+    for row = 0, math.floor((len - 1) / 16) do
+        local line = string.format("%016X  ", (base or 0) + row * 16)
+        local txt = ""
+        for i = 0, 15 do
+            local o = row * 16 + i
+            if o < len then
+                local b = string.byte(buf, o + 1)
+                line = line .. string.format("%02X ", b)
+                if b >= 32 and b < 127 then txt = txt .. string.char(b) else txt = txt .. "." end
+            else
+                line = line .. "   "
+            end
+        end
+        out[#out + 1] = line .. " " .. txt
+    end
+    return table.concat(out, "\n")
+end
+
+function m.probe_write(tag)
+    if not m.state.dir then return end
+    local f = io.open(m.state.dir .. "\\probe.txt", "a")
+    if not f then
+        log_once("probeopen", "cannot write probe.txt", 30000)
+        return false
+    end
+    f:write("\n==== " .. os.date("%Y-%m-%d %H:%M:%S") .. "  " .. tostring(tag) .. " ====\n")
+    f:write("module " .. m.VERSION .. "  ffi=" .. tostring(ffi_ok) .. "\n")
+    local st = nil
+    if match and match.stats then st = match.stats() end
+    if st then
+        f:write(string.format("score %d-%d  pk %s-%s  period %s  clock %s:%s  added %s  ptr %s\n",
+            tonumber(st.home_score) or -1, tonumber(st.away_score) or -1,
+            tostring(st.pk_home_score), tostring(st.pk_away_score),
+            tostring(st.period), tostring(st.clock_minutes), tostring(st.clock_seconds),
+            tostring(st.added_minutes), tostring(st.ptr)))
+    else
+        f:write("match.stats() returned nil (match-stats.enabled = " ..
+                tostring(m.eng.ini_ok) .. ")\n")
+    end
+    f:write(string.format("guessed stats region %s  pitch region %s  validated %s\n",
+        hex(m.reg.stats or 0), hex(m.reg.pitch or 0), tostring(m.stats_validated)))
+    local buf, sci = nil, m.match.sci
+    if sci and sci ~= 0 then
+        buf = m.read_big(sci, 0x200)
+        if buf then
+            f:write("SCOREBOARD_INFO @ " .. hex(sci) .. "\n" .. hexdump(buf, 0x200, sci) .. "\n")
+        end
+    end
+    if ffi_ok then
+        f:write("committed regions >= 64 KB\n")
+        local mbi = ffi.new("NGB_MBI[1]")
+        local addr = 0x10000
+        local n = 0
+        while n < 20000 do
+            n = n + 1
+            if C.NGB_VirtualQuery(ffi.cast("const void *", addr), mbi, ffi.sizeof(mbi)) == 0 then break end
+            local base = tonumber(ffi.cast("uint64_t", mbi[0].BaseAddress))
+            local size = tonumber(mbi[0].RegionSize)
+            local state = mbi[0].State
+            if size == 0 then break end
+            if state == 0x1000 and size >= 0x10000 and size < 0x4000000 then
+                local head = m.read_big(base, 64)
+                f:write(string.format("%016X  size %08X  %s\n", base, size,
+                    head and hexdump(head, 64, 0):gsub("^%s+", ""):gsub("\n.*", "") or ""))
+            end
+            addr = base + size
+            if addr >= 0x7FFFFFFF0000 then break end
+        end
+    end
+    f:close()
+    log_msg("probe written: " .. tostring(m.state.dir) .. "\\probe.txt")
+    return true
+end
+
+-- ============================================================================
 -- 15. Events (goal / shot / MOTM)
 -- ============================================================================
 m.ev = nil          -- active event
@@ -1754,6 +1992,184 @@ end
 
 m.fire_shot_event = fire_shot_event
 
+-- ============================================================================
+-- 15b. Goals, half time and full time  (all fed by the scoreboard + hook)
+-- ============================================================================
+local function score_line_text(h, a)
+    return tostring(h) .. " - " .. tostring(a)
+end
+m.score_line_text = score_line_text
+
+local function scorers_copy()
+    local out = {}
+    for i = 1, #m.scorers do
+        local g = m.scorers[i]
+        out[i] = { name = g.name, side = g.side, minute = g.minute, kind = g.kind or "goal" }
+    end
+    return out
+end
+
+-- one goal, presented
+function m.goal_hook(g)
+    if not presentation_on() then
+        log_msg("presentation off - goal card not displayed")
+        return nil
+    end
+    local now = now_ms()
+    local side = (tonumber(g.side) == 1) and 1 or 0
+    local name = clean_name(g.name or "")
+    local pid = tonumber(g.pid) or 0
+    local minute = tonumber(g.minute) or m.match.clock_min or 0
+    local own = (g.kind == "own_goal")
+
+    if pid ~= 0 then
+        m.tally[pid] = (m.tally[pid] or 0) + 1
+    end
+    local tally = (pid ~= 0) and m.tally[pid] or 0
+    m.tally_score.home = m.tally_score.home or 0
+    m.tally_score.away = m.tally_score.away or 0
+    if g.counted ~= false then
+        if own then
+            if side == 0 then m.tally_score.away = m.tally_score.away + 1
+            else m.tally_score.home = m.tally_score.home + 1 end
+        else
+            if side == 0 then m.tally_score.home = m.tally_score.home + 1
+            else m.tally_score.away = m.tally_score.away + 1 end
+        end
+    end
+
+    local h, a = current_score()
+    local total = h + a
+    m.scorers[#m.scorers + 1] = {
+        name = name, side = side, minute = minute, kind = own and "own_goal" or "goal",
+    }
+    m.eng.goals = (m.eng.goals or 0) + 1
+    m.eng.last_goal_at = now
+    m.eng.last_goal_name = name
+
+    local dur = cfg_f("goal_telemetry_duration", 13.0)
+    local milestone = nil
+    if not own and tally > 0 then
+        milestone = milestone_for(tally, total)
+    end
+
+    local ev = push_event("goal", side, nil, {
+        player_known = (name ~= ""),
+        player = {
+            name = string.upper(name),
+            shirt = 0, pos = "", rating = 0,
+            minutes = minute, minutes_exact = true,
+            pid = pid,
+        },
+        team = team_of(side),
+        minute = minute,
+        score = { home = h, away = a },
+        score_line = score_line_text(h, a),
+        tally = tally,
+        kind_detail = own and "own_goal" or "goal",
+        milestone = milestone,
+        duration = dur,
+        remaining = dur,
+    })
+    ev.show_at = ev.started + clamp(cfg_f("goal_telemetry_delay", 1.2), 0, 8) * 1000
+
+    if milestone and cfg_i("milestone_toast_enabled", 1) ~= 0
+       and (milestone.key == "hat_trick" or milestone.key == "haul") then
+        set_toast(milestone.label .. "  |  " .. string.upper(name), "milestone")
+    end
+
+    log_msg(string.format("GOAL  %s  %s  %d'  %s", side == 0 and "home" or "away",
+        name ~= "" and name or "(scorer unknown)", minute, score_line_text(h, a)))
+
+    if cfg_i("probe_enabled", 0) ~= 0 then
+        m.probe_write("goal " .. tostring(name) .. " " .. string.upper(tostring(m.match[side == 0 and "home" or "away"].abbr or "")))
+    end
+
+    if cfg_i("replay_camera_enabled", 1) ~= 0 then
+        m.cam_start(dur)
+    end
+    m.goal_window_until = now + (cfg_f("replay_window_max", 45) * 1000)
+    return ev
+end
+
+-- a goal the scoreboard reported but the hook did not: show it without a name
+function m.goal_fallback(side)
+    return m.goal_hook({ side = side, name = "", pid = 0,
+                         minute = m.match.clock_min, kind = "goal", counted = false })
+end
+
+-- half time / full time
+function m.show_result(kind, extra)
+    if cfg_i("result_card_enabled", 1) == 0 then return nil end
+    if not presentation_on() then return nil end
+    local h, a = current_score()
+    local dur = cfg_f("result_card_duration", 9.0)
+    local ev = push_event("fulltime", 0, nil, {
+        result = kind,
+        score = { home = h, away = a },
+        score_line = score_line_text(h, a),
+        scorers = scorers_copy(),
+        pk = { home = m.match.pk_home or 0, away = m.match.pk_away or 0 },
+        duration = dur,
+        remaining = dur,
+    })
+    log_msg(string.format("%s  %s", string.upper(kind), score_line_text(h, a)))
+    return ev
+end
+
+-- scoreboard watcher: catches a goal whose hook did not fire, and a reset
+local function watch_scoreboard(now)
+    if not m.eng.ok then return end
+    local h, a = m.eng.score.home or 0, m.eng.score.away or 0
+    local ph, pa = m.eng.prev.home or 0, m.eng.prev.away or 0
+    if h < ph or a < pa then
+        -- score went backwards: a new match (or a VAR reversal). re-baseline.
+        m.eng.prev.home, m.eng.prev.away = h, a
+        if h == 0 and a == 0 then
+            m.tally_score.home, m.tally_score.away = 0, 0
+            m.scorers = {}
+            m.tally = {}
+            m.eng.goals = 0
+            m.ft_shown = false
+        end
+        return
+    end
+    if h == ph and a == pa then return end
+    local side = (h > ph) and 0 or 1
+    local fresh = (now - (m.eng.last_goal_at or 0)) < 3000
+    m.eng.prev.home, m.eng.prev.away = h, a
+    if not fresh then
+        log_msg("scoreboard goal without a hook event - showing an unnamed goal card")
+        m.goal_fallback(side)
+    end
+end
+
+-- half time / full time watcher
+local function watch_period(now)
+    if not m.eng.ok then return end
+    local p = m.match.period or 0
+    local prev = m.eng.prev.period or -1
+    if p ~= prev then
+        if prev == 1 and p == 2 and cfg_i("result_card_enabled", 1) ~= 0 then
+            m.show_result("half_time")
+        end
+        m.eng.prev.period = p
+    end
+    if cfg_i("result_card_enabled", 1) ~= 0 and not m.ft_shown then
+        local limit = (p >= 3) and 120 or 90
+        if p >= 2 and (m.match.clock_min or 0) >= limit
+           and not m.match.running and not m.match.paused then
+            if not m.ft_at then m.ft_at = now end
+            if (now - m.ft_at) > 2500 then
+                m.ft_shown = true
+                m.show_result("full_time")
+            end
+        end
+    end
+    if not m.match.paused then m.ft_at = m.ft_at end
+end
+
+
 -- ---- MOTM -----------------------------------------------------------------
 m.motm = nil
 
@@ -1873,6 +2289,7 @@ m.baselined = false
 m.poll = { last_stats = 0, last_pos = 0, last_state = 0, last_match = 0 }
 
 local function detect_events()
+    if not m.player_stats_ok() then return end
     local best = nil
     local assist_rises = {}
     for side = 0, 1 do
@@ -1990,7 +2407,7 @@ local function build_state(now)
             style = clamp(cfg_i("presentation_style", 0), 0, 2),
             analysis = (cfg_i("shot_analysis_enabled", 1) ~= 0),
             units = (cfg.units == "metric") and "metric" or "imperial",
-            scorebug = (cfg_i("show_scorebug", 0) ~= 0),
+            scorebug = (cfg_i("show_scorebug", 1) ~= 0),
             credit = (cfg_i("credit_line", 1) ~= 0) and m.BRAND or "",
             author = m.AUTHOR,
             tagline = m.TAGLINE,
@@ -2007,6 +2424,16 @@ local function build_state(now)
             overlay_visible = (now - (m.overlay_seen or 0)) < 400,
             style = clamp(cfg_i("presentation_style", 0), 0, 2),
             analysis = (cfg_i("shot_analysis_enabled", 1) ~= 0),
+            -- what this build can actually deliver, so the HUD can hide what
+            -- it cannot fill in instead of printing zeros
+            data = {
+                scoreboard = m.data_source(),
+                clock = m.data_source(),
+                player_stats = m.player_stats_ok(),
+                scorer_hook = m.eng.lib,
+                match_stats_ini = m.eng.ini_ok,
+                shots = m.player_stats_ok(),
+            },
         },
         match = {
             clock = m.clock_str(),
@@ -2025,7 +2452,11 @@ local function build_state(now)
                 score = m.match.away.score,
                 color = m.match.away.color or "#FF7043",
             },
+            score_line = score_line_text(m.match.home.score or 0, m.match.away.score or 0),
+            pk_home = m.match.pk_home or 0,
+            pk_away = m.match.pk_away or 0,
         },
+        scorers = scorers_copy(),
     }
 
     if m.toast then
@@ -2047,6 +2478,11 @@ local function build_state(now)
             remaining = round(ev.remaining or 0, 2),
             duration = ev.duration or 0,
             side = (ev.side == 0) and "home" or "away",
+            minute = ev.minute or m.match.clock_min or 0,
+            player_known = (ev.player_known == true),
+            tally = ev.tally or 0,
+            score_line = ev.score_line or "",
+            detail = ev.kind_detail or "goal",
             player = {
                 name = p.name or "",
                 shirt = p.shirt or 0,
@@ -2076,6 +2512,14 @@ local function build_state(now)
                 xg = round(s.xg or 0, 2),
             },
         }
+        if ev.score then
+            e.score = { home = ev.score.home or 0, away = ev.score.away or 0 }
+        end
+        if ev.kind == "fulltime" then
+            e.result = ev.result or "full_time"
+            e.scorers = ev.scorers or {}
+            if ev.pk then e.pk = { home = ev.pk.home or 0, away = ev.pk.away or 0 } end
+        end
         if ev.milestone then
             e.milestone = {
                 key = ev.milestone.key,
@@ -2186,11 +2630,23 @@ function m.overlay_text()
         style_names[clamp(cfg_i("presentation_style", 0), 0, 2)],
         yn(cfg_i("shot_analysis_enabled", 1) ~= 0))
 
-    local regs = string.format("stat %s  pitch %s  camera %s  names %s",
-        m.reg.stats ~= 0 and "ok" or "--",
-        m.reg.pitch ~= 0 and "ok" or "--",
+    -- where the numbers come from, in plain words
+    local src = m.data_source()
+    if src == "sider" then
+        out[#out + 1] = string.format("ENGINE   scoreboard ok (%d'%02d)   goals seen %d",
+            m.match.clock_min or 0, m.match.clock_sec or 0, m.eng.goals or 0)
+    elseif m.eng.ini_ok == false then
+        out[#out + 1] = "ENGINE   OFF  ->  add  match-stats.enabled = 1  to sider.ini"
+    elseif not m.eng.lib then
+        out[#out + 1] = "ENGINE   OFF  ->  this Sider build has no match library"
+    else
+        out[#out + 1] = "ENGINE   waiting for a match (scoreboard returns nothing yet)"
+    end
+    local regs = string.format("PLAYER DATA %s   camera %s   names %s   hud %s",
+        m.player_stats_ok() and "ok" or "off",
         m.cam.ok and "ok" or "--",
-        m.db_ready and "ok" or "--")
+        m.db_ready and "ok" or "--",
+        (m.state.path and m.state.errors == 0) and "writing" or "ERROR")
     out[#out + 1] = regs
 
     local ev = m.ev
@@ -2214,9 +2670,14 @@ function m.overlay_text()
                 ev.shot.angle_deg, ev.shot.xg or 0,
                 ev.shot.origin_source == "measured" and "measured" or "model")
         end
-        out[#out + 1] = string.format("  SHOTS %d   ON TARGET %d   GOALS %d   ASSISTS %d   G/A %d   MIN %s",
-            s_.shots or 0, s_.on_target or 0, s_.goals or 0, s_.assists or 0, s_.ga or 0,
-            tostring(p.minutes or 0))
+        if m.player_stats_ok() then
+            out[#out + 1] = string.format("  SHOTS %d   ON TARGET %d   GOALS %d   ASSISTS %d   G/A %d   MIN %s",
+                s_.shots or 0, s_.on_target or 0, s_.goals or 0, s_.assists or 0, s_.ga or 0,
+                tostring(p.minutes or 0))
+        else
+            out[#out + 1] = string.format("  %d'%02d   %s   goals this match %d",
+                ev.minute or 0, 0, ev.score_line or "", ev.tally or 0)
+        end
         if ev.assist then out[#out + 1] = "  ASSIST  " .. tostring(ev.assist.name) end
     else
         out[#out + 1] = "idle - waiting for a shot, goal or full time"
@@ -2305,10 +2766,32 @@ function m.tick(now)
         read_pitch()
     end
 
-    -- per player stats
+    -- scoreboard watchers: no memory region involved, they run on their own
+    -- clock so a goal is caught even when everything else is unavailable
+    if (now - (m.poll.last_watch or 0)) >= 200 then
+        m.poll.last_watch = now
+        if not m.match.paused then
+            watch_scoreboard(now)
+            watch_period(now)
+        end
+    end
+
+    -- is the experimental player scan telling the truth? ask it once a while
+    if cfg_i("experimental_player_stats", 0) ~= 0 then
+        if m.reg.stats ~= 0 and not m.stats_validated and (now - (m.stats_checked_at or 0)) > 5000 then
+            m.stats_checked_at = now
+            m.stats_validated = m.validate_stats()
+            log_msg("player stat table validation: " .. tostring(m.stats_validated))
+        elseif m.stats_validated and (now - (m.stats_checked_at or 0)) > 30000 then
+            m.stats_checked_at = now
+            m.stats_validated = m.validate_stats()
+        end
+    end
+
+    -- per player stats (only once the scan has proved it agrees with the game)
     local stat_ms = cfg_i("stats_poll_ms", 350)
     if stat_ms < 100 then stat_ms = 100 end
-    if m.reg.stats ~= 0 and (now - m.poll.last_stats) >= stat_ms then
+    if m.player_stats_ok() and (now - m.poll.last_stats) >= stat_ms then
         m.poll.last_stats = now
         if not m.match.paused then detect_events() end
     end
@@ -2363,35 +2846,23 @@ end
 
 function m.on_goal_scored(ctx, goal)
     m.ctx = ctx
+    if type(goal) ~= "table" then return end
+    local side = (tonumber(goal.home_or_away) == 1) and 1 or 0
+    local name = tostring(goal.player_name_on_shirt or "")
     if cfg_i("debug_log", 0) ~= 0 then
         log_msg("goal_scored: id=" .. tostring(goal.player_id) ..
+                " offset=" .. tostring(goal.player_offset) ..
                 " away=" .. tostring(goal.home_or_away) ..
-                " name=" .. tostring(goal.player_name_on_shirt))
+                " name=" .. name)
     end
-    -- The stat poll normally catches the goal; this handler only covers the
-    -- case where the stat region is still being discovered.
-    if m.reg.stats == 0 or not m.baselined then
-        local side = goal.home_or_away or 0
-        local ev = {
-            id = m.ev_id + 1,
-            kind = "goal",
-            side = side,
-            idx = 0,
-            started = now_ms(),
-            duration = cfg_f("goal_telemetry_duration", 16.0),
-            remaining = cfg_f("goal_telemetry_duration", 16.0),
-            player = {
-                name = string.upper(tostring(goal.player_name_on_shirt or "GOAL")),
-                shirt = 0, pos = "", rating = 0,
-            },
-            team = team_of(side),
-            stats = { shots = 0, on_target = 0, goals = 1, assists = 0, ga = 1 },
-        }
-        m.ev_id = ev.id
-        m.ev = ev
-        m.last_ev = ev
-        m.cam_start(ev.duration)
-    end
+    m.goal_hook({
+        side = side,
+        name = name,
+        pid = tonumber(goal.player_id) or 0,
+        offset = tonumber(goal.player_offset) or 0,
+        minute = m.match.clock_min or 0,
+        kind = "goal",
+    })
 end
 
 function m.on_set_teams(ctx)
@@ -2615,6 +3086,15 @@ function m.init(ctx)
     -- optional early region hint from the INI
     apply_region_override()
 
+    -- is the match library switched on in sider.ini?
+    m.check_ini_flags()
+
+    if not m.eng.lib then
+        log_once("nomatlib",
+            "this Sider build does not expose the 'match' library - goal cards will only " ..
+            "appear from the goal hook, without the score", 60000)
+    end
+
     -- first state file so the companion can start straight away
     m.write_state(now_ms())
 
@@ -2627,6 +3107,10 @@ end
 -- ============================================================================
 m._test = {
     read_head = read_head,
+    goal = function(t) return m.goal_hook(t) end,
+    result = function(k) return m.show_result(k) end,
+    probe = function(t) return m.probe_write(t) end,
+    validate = function() return m.validate_stats() end,
     detect_events = function() return detect_events() end,
     set_cfg = function(t) for k, v in pairs(t) do cfg[k] = v end end,
     set_region = function(s, p) m.reg.stats = s or 0; m.reg.pitch = p or 0; m.reg.ok = (m.reg.stats ~= 0) end,

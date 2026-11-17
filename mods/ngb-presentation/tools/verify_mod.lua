@@ -80,69 +80,7 @@ setmetatable(env, {
 local chunk, lerr = loadstring(SRC, "NGB_Presentation.lua")
 if not chunk then
     check("module loads", false, lerr)
-    -- ---------------------------------------------------------------------------
--- 11. Presentation controls (the 7 / 8 / 9 hotkeys)
--- ---------------------------------------------------------------------------
-local function hud_now() return m._test.state().hud end
-
-m._test.reset()
-m.ev = nil
-m.toast = nil
-clock_ms = clock_ms + 400; m.tick(clock_ms)
-
-local h0 = hud_now()
-check("controls: default style is full", h0.style == 0, h0.style)
-check("controls: analysis on by default", h0.analysis == true, tostring(h0.analysis))
-
--- overlay closed -> digits are ignored, so the game keeps its own 7/8/9 keys
-m.on_key_down(CTX, 0x37)
-check("hotkey [7] ignored while the overlay is closed", hud_now().style == h0.style,
-      hud_now().style)
-m.on_key_down(CTX, 0x38)
-check("hotkey [8] ignored while the overlay is closed", hud_now().master == h0.master,
-      tostring(hud_now().master))
-
--- overlay open -> 7 cycles the style, 9 toggles analysis, 8 toggles the master
-m.on_overlay_on(CTX)
-m.on_key_down(CTX, 0x37)
-check("hotkey [7] cycles style", hud_now().style == 1, hud_now().style)
-m.on_key_down(CTX, 0x37)
-check("hotkey [7] cycles style again", hud_now().style == 2, hud_now().style)
-m.on_key_down(CTX, 0x37)
-check("hotkey [7] wraps back to full", hud_now().style == 0, hud_now().style)
-check("hotkey toast exposed in state", hud_now().toast ~= nil
-      and hud_now().toast.kind == "style", hud_now().toast and hud_now().toast.text)
-
-m.on_key_down(CTX, 0x39)
-check("hotkey [9] disables shot analysis", hud_now().analysis == false, tostring(hud_now().analysis))
-m.on_key_down(CTX, 0x39)
-check("hotkey [9] enables shot analysis", hud_now().analysis == true, tostring(hud_now().analysis))
-
--- F7 / F8 / F9 must not be bound
-local before_style = hud_now().style
-local before_master = hud_now().master
-local before_analysis = hud_now().analysis
-m.on_key_down(CTX, 0x76); m.on_key_down(CTX, 0x77); m.on_key_down(CTX, 0x78)
-check("no F7 / F8 / F9 hotkeys", hud_now().style == before_style
-      and hud_now().master == before_master and hud_now().analysis == before_analysis)
-
--- master switch really stops new cards
-m._test.set_region(STATS_BASE, PITCH_BASE)
-m.ev = nil
-m.baselined = false
-clock_ms = clock_ms + 400; m.tick(clock_ms)
-clock_ms = clock_ms + 400; m.tick(clock_ms)
-m.on_key_down(CTX, 0x38)
-check("hotkey [8] switches the presentation off", hud_now().master == false, tostring(hud_now().master))
-m.ev = nil
-set_stat(0, 4, 0, 4)
-clock_ms = clock_ms + 400; m.tick(clock_ms)
-clock_ms = clock_ms + 400; m.tick(clock_ms)
-check("presentation off: no new card", m.ev == nil, m.ev and m.ev.kind)
-m.on_key_down(CTX, 0x38)
-check("hotkey [8] switches the presentation back on", hud_now().master == true, tostring(hud_now().master))
-
-return RESULTS
+    return RESULTS
 end
 setfenv(chunk, env)
 local m = chunk()
@@ -356,7 +294,11 @@ m.init(CTX)
 check("init: does not throw", true)
 check("init: FFI detected", m._test ~= nil)
 m._test.set_region(STATS_BASE, PITCH_BASE)
-m._test.set_cfg({ stats_poll_ms = "0", position_poll_ms = "0", state_write_hz = "20" })
+m._test.set_cfg({ stats_poll_ms = "0", position_poll_ms = "0", state_write_hz = "20",
+                  experimental_player_stats = "1" })
+-- the scan is only trusted after it passes validation; in the harness the
+-- fixture is already known-good, so mark it validated here
+m.stats_validated = true
 
 -- baseline tick (2 frames so the 8 ms gate and the poll gates open)
 for i = 1, 3 do clock_ms = clock_ms + 200; m.tick(clock_ms) end
@@ -456,7 +398,7 @@ check("goal: card appears after the delay",
 -- state.json
 clock_ms = clock_ms + 200; m.tick(clock_ms)
 local state = m._test.state()
-check("state: schema version", state.v == 2, state.v)
+check("state: schema version", state.v == 3, state.v)
 check("state: hud master flag", state.hud.master ~= nil, tostring(state.hud.master))
 check("state: hud style", state.hud.style ~= nil, tostring(state.hud.style))
 check("state: hud analysis flag", state.hud.analysis ~= nil, tostring(state.hud.analysis))
@@ -584,7 +526,7 @@ m._test.set_region(0, 0)
 m._test.reset()
 clock_ms = clock_ms + 400; m.tick(clock_ms)
 check("no stats region: tick survives", true)
-check("no stats region: state still valid", m._test.state().v == 2)
+check("no stats region: state still valid", m._test.state().v == 3)
 
 -- context reset clears everything
 m.on_context_reset(CTX)
@@ -597,5 +539,144 @@ local d = m.demo_preview()
 check("demo preview produces event", d ~= nil and d.kind == "goal", d and d.kind)
 check("demo telemetry estimated", d and d.shot and d.shot.origin_source ~= nil,
       d and d.shot and d.shot.origin_source)
+
+    -- ---------------------------------------------------------------------------
+-- 10b. Engine truth: Sider goal_scored + scoreboard (the path that always works)
+-- ---------------------------------------------------------------------------
+m._test.reset()
+m.ev = nil
+m.scorers = {}
+m.tally = {}
+m.tally_score.home, m.tally_score.away = 0, 0
+MATCH_STATS.home_score, MATCH_STATS.away_score = 0, 0
+MATCH_STATS.clock_minutes, MATCH_STATS.clock_seconds = 23, 41
+MATCH_STATS.period = 1
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+m.eng.prev.home, m.eng.prev.away = 0, 0
+m.eng.prev.period = 1
+m.eng.last_goal_at = clock_ms
+
+check("engine: scoreboard is the reported source", m.data_source() == "sider", m.data_source())
+check("engine: clock from the scoreboard", m.clock_str() == "23:41", m.clock_str())
+
+m._test.set_cfg({ experimental_player_stats = "0" })
+m.ev = nil
+set_stat(0, 4, 6, 30)
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+check("player stats off: no card from the scan",
+      m.ev == nil or m.ev.kind ~= "shot", m.ev and m.ev.kind)
+check("player stats off: state says so",
+      m._test.state().status.data.player_stats == false)
+m._test.set_cfg({ experimental_player_stats = "1" })
+
+m.on_goal_scored(CTX, { player_id = 100004, player_offset = 0x1000, home_or_away = 0,
+                        player_name_on_shirt = "ODEGAARD" })
+local gev = m.ev
+check("goal hook: event created", gev ~= nil and gev.kind == "goal", gev and gev.kind)
+check("goal hook: scorer named from the game", gev and gev.player_known == true
+      and gev.player.name == "ODEGAARD", gev and gev.player and gev.player.name)
+check("goal hook: minute from the clock", gev and gev.minute == 23, gev and gev.minute)
+check("goal hook: milestone on the first goal", gev and gev.milestone ~= nil,
+      gev and gev.milestone and gev.milestone.label)
+
+MATCH_STATS.home_score = 1
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+m.on_goal_scored(CTX, { player_id = 100004, home_or_away = 0, player_name_on_shirt = "ODEGAARD" })
+gev = m.ev
+check("goal hook: brace on the second goal", gev and gev.milestone
+      and gev.milestone.key == "brace", gev and gev.milestone and gev.milestone.label)
+check("goal hook: per player tally", gev and gev.tally == 2, gev and gev.tally)
+
+MATCH_STATS.home_score = 3
+m.eng.last_goal_at = 0
+clock_ms = clock_ms + 6000; m.tick(clock_ms)
+gev = m.ev
+check("scoreboard fallback: unnamed goal card", gev and gev.kind == "goal"
+      and gev.player_known == false, gev and tostring(gev.player_known))
+
+MATCH_STATS.period = 2
+clock_ms = clock_ms + 600; m.tick(clock_ms)
+gev = m.ev
+check("half time card", gev and gev.kind == "fulltime" and gev.result == "half_time",
+      gev and tostring(gev.result))
+
+local stj = m._test.state()
+check("state: data block reports the scoreboard", stj.status.data ~= nil
+      and stj.status.data.scoreboard == "sider",
+      stj.status.data and stj.status.data.scoreboard)
+check("state: scorer list filled", type(stj.scorers) == "table" and #stj.scorers >= 2,
+      stj.scorers and #stj.scorers)
+check("state: score line present", type(stj.match.score_line) == "string"
+      and stj.match.score_line ~= "", stj.match.score_line)
+
+m._test.reset()
+m.ev = nil
+m.scorers = {}
+m.tally = {}
+m.stats_validated = true
+
+-- ---------------------------------------------------------------------------
+-- 11. Presentation controls (the 7 / 8 / 9 hotkeys)
+-- ---------------------------------------------------------------------------
+local function hud_now() return m._test.state().hud end
+
+m._test.reset()
+m.ev = nil
+m.toast = nil
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+
+local h0 = hud_now()
+check("controls: default style is full", h0.style == 0, h0.style)
+check("controls: analysis on by default", h0.analysis == true, tostring(h0.analysis))
+
+-- overlay closed -> digits are ignored, so the game keeps its own 7/8/9 keys
+m.on_key_down(CTX, 0x37)
+check("hotkey [7] ignored while the overlay is closed", hud_now().style == h0.style,
+      hud_now().style)
+m.on_key_down(CTX, 0x38)
+check("hotkey [8] ignored while the overlay is closed", hud_now().master == h0.master,
+      tostring(hud_now().master))
+
+-- overlay open -> 7 cycles the style, 9 toggles analysis, 8 toggles the master
+m.on_overlay_on(CTX)
+m.on_key_down(CTX, 0x37)
+check("hotkey [7] cycles style", hud_now().style == 1, hud_now().style)
+m.on_key_down(CTX, 0x37)
+check("hotkey [7] cycles style again", hud_now().style == 2, hud_now().style)
+m.on_key_down(CTX, 0x37)
+check("hotkey [7] wraps back to full", hud_now().style == 0, hud_now().style)
+check("hotkey toast exposed in state", hud_now().toast ~= nil
+      and hud_now().toast.kind == "style", hud_now().toast and hud_now().toast.text)
+
+m.on_key_down(CTX, 0x39)
+check("hotkey [9] disables shot analysis", hud_now().analysis == false, tostring(hud_now().analysis))
+m.on_key_down(CTX, 0x39)
+check("hotkey [9] enables shot analysis", hud_now().analysis == true, tostring(hud_now().analysis))
+
+-- F7 / F8 / F9 must not be bound
+local before_style = hud_now().style
+local before_master = hud_now().master
+local before_analysis = hud_now().analysis
+m.on_key_down(CTX, 0x76); m.on_key_down(CTX, 0x77); m.on_key_down(CTX, 0x78)
+check("no F7 / F8 / F9 hotkeys", hud_now().style == before_style
+      and hud_now().master == before_master and hud_now().analysis == before_analysis)
+
+-- master switch really stops new cards
+m._test.set_region(STATS_BASE, PITCH_BASE)
+m.ev = nil
+m.baselined = false
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+m.on_key_down(CTX, 0x38)
+check("hotkey [8] switches the presentation off", hud_now().master == false, tostring(hud_now().master))
+m.ev = nil
+set_stat(0, 4, 0, 4)
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+clock_ms = clock_ms + 400; m.tick(clock_ms)
+check("presentation off: no new card", m.ev == nil, m.ev and m.ev.kind)
+m.on_overlay_on(CTX)          -- the overlay is open again, hotkeys live
+m.on_key_down(CTX, 0x38)
+check("hotkey [8] switches the presentation back on", hud_now().master == true, tostring(hud_now().master))
+
 
 return RESULTS
