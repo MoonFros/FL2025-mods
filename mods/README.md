@@ -7,6 +7,7 @@ docs and verifier.
 | Folder | Mod |
 |--------|-----|
 | `fc27-broadcast/` | EA FC 27 HyperMotion Broadcast & Replay Telemetry |
+| `ngb-presentation/` | Next-Gen Football Broadcast Presentation (MOONFROS PRESENTS) |
 | `_template/` | Skeleton to copy when starting a new mod |
 
 The layout rules and the checklist for a new mod are in the
